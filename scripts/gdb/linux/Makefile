@@ -16,7 +16,7 @@ endif
 quiet_cmd_gen_constants_py = GEN     $@
       cmd_gen_constants_py = \
 	$(CPP) -E -x c -P $(c_flags) $< > $@ ;\
-	sed -i '1,/<!-- end-c-headers -->/d;' $@
+	gsed -i '1,/<!-- end-c-headers -->/d;' $@
 
 always-y += constants.py
 $(obj)/constants.py: $(src)/constants.py.in FORCE
