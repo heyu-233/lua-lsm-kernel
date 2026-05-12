@@ -14,14 +14,12 @@ export PATH="$(brew --prefix lld)/bin:$PATH"
 export HOSTCFLAGS="-D_UUID_T -D__GETHOSTUUID_H -DO_LARGEFILE=0"
 
 
-# Use gnu sed instead of builtin sed
+# Use gnu coreutils instead of builtin tools
 alias sed='gsed'
 
 
 # Maybe the symlink is missed on macOS
-#ln -s ../../../scripts/syscall.tbl arch/arm64/tools/syscall_64.tbl
-#ln -s qcom,sm8550-dispcc.h include/dt-bindings/clock/qcom,sm8650-dispcc.h
-
+# git config --global core.symlinks true
 
 #make ARCH=arm64 LLVM=1
 
