@@ -658,6 +658,125 @@ static int lua_shared_newindex(lua_State *L)
 	return 0;
 }
 
+/********************* securityfs shared dict wrappers ***********************/
+
+/*
+ * Look up a module by name and one of its shared dicts.  On success the
+ * caller finds modules_mutex still held and must keep it held for the
+ * whole kvcache operation before unlocking.
+ *
+ * Lifetime boundary for the PoC: lua_lsm_module_unregister() moves the
+ * module out of LMS_STATE_LIVE and frees its shdicts under the same
+ * mutex, so a dict found here while the module is LIVE cannot be torn
+ * down underneath us.  A module that is GOING/ZOMBIE (or anything else
+ * non-LIVE) is rejected with -ESHUTDOWN before its dict is touched.
+ */
+static int lua_lsm_shdict_find(struct lua_lsm_module_shdict **out,
+			       const char *module_name, const char *dict_name)
+{
+	struct lua_lsm_module *module;
+	struct lua_lsm_module_shdict *shdict;
+	unsigned long flags;
+	int found = 0;
+
+	mutex_lock(&modules_mutex);
+	list_for_each_entry(module, &lsm_modules, list) {
+		if (strcmp(module->name, module_name) == 0) {
+			found = 1;
+			break;
+		}
+	}
+	if (!found)
+		goto err_enoent;
+
+	if (module->state != LMS_STATE_LIVE)
+		goto err_eshutdown;
+
+	spin_lock_irqsave(&module->shdict_lock, flags);
+	list_for_each_entry(shdict, &module->shdicts, list) {
+		if (strcmp(shdict->name, dict_name) == 0)
+			break;
+	}
+	spin_unlock_irqrestore(&module->shdict_lock, flags);
+	if (&shdict->list == &module->shdicts)
+		goto err_enoent;
+
+	*out = shdict;
+	return 0;		/* modules_mutex is kept held */
+
+err_eshutdown:
+	mutex_unlock(&modules_mutex);
+	return -ESHUTDOWN;
+err_enoent:
+	mutex_unlock(&modules_mutex);
+	return -ENOENT;
+}
+
+int lua_lsm_shdict_set_bool(const char *module_name, const char *dict_name,
+			    const char *key, bool value)
+{
+	struct lua_lsm_module_shdict *shdict;
+	size_t key_len = strlen(key);
+	int err;
+
+	err = lua_lsm_shdict_find(&shdict, module_name, dict_name);
+	if (err)
+		return err;
+
+	err = kvcache_set_bool(&shdict->dict, NULL, key, key_len, value);
+	mutex_unlock(&modules_mutex);
+	return err;
+}
+
+int lua_lsm_shdict_set_number(const char *module_name, const char *dict_name,
+			      const char *key, long long value)
+{
+	struct lua_lsm_module_shdict *shdict;
+	size_t key_len = strlen(key);
+	int err;
+
+	err = lua_lsm_shdict_find(&shdict, module_name, dict_name);
+	if (err)
+		return err;
+
+	err = kvcache_set_number(&shdict->dict, NULL, key, key_len, value);
+	mutex_unlock(&modules_mutex);
+	return err;
+}
+
+int lua_lsm_shdict_set_string(const char *module_name, const char *dict_name,
+			      const char *key, const char *value,
+			      size_t value_len)
+{
+	struct lua_lsm_module_shdict *shdict;
+	size_t key_len = strlen(key);
+	int err;
+
+	err = lua_lsm_shdict_find(&shdict, module_name, dict_name);
+	if (err)
+		return err;
+
+	err = kvcache_set_string(&shdict->dict, NULL, key, key_len,
+				 value, value_len);
+	mutex_unlock(&modules_mutex);
+	return err;
+}
+
+int lua_lsm_shdict_get(const char *module_name, const char *dict_name,
+		       const char *key, struct kvcache_snapshot *snap)
+{
+	struct lua_lsm_module_shdict *shdict;
+	int err;
+
+	err = lua_lsm_shdict_find(&shdict, module_name, dict_name);
+	if (err)
+		return err;
+
+	err = kvcache_get_snapshot(&shdict->dict, NULL, key, snap);
+	mutex_unlock(&modules_mutex);
+	return err;
+}
+
 static int lua_module_fenv_newindex(lua_State *L)
 {
 	/* args: t, k, v */
