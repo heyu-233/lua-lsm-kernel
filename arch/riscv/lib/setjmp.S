@@ -32,6 +32,19 @@ EXPORT_SYMBOL(setjmp)
  * void longjmp(struct label_t *label, int val);
  */
 SYM_FUNC_START(longjmp)
+#ifdef CONFIG_KASAN_STACK
+	/* Skipped C epilogues cannot unpoison the abandoned stack frames. */
+	addi	sp, sp, -(4*SZREG)
+	REG_S	a0, 0*SZREG(sp)
+	REG_S	a1, 1*SZREG(sp)
+	REG_S	ra, 2*SZREG(sp)
+	REG_L	a0, 1*SZREG(a0)
+	call	kasan_unpoison_task_stack_below
+	REG_L	a0, 0*SZREG(sp)
+	REG_L	a1, 1*SZREG(sp)
+	REG_L	ra, 2*SZREG(sp)
+	addi	sp, sp, 4*SZREG
+#endif
 	REG_L	ra,  0*SZREG(a0)
 	REG_L	s0,  2*SZREG(a0)
 	REG_L	s1,  3*SZREG(a0)
