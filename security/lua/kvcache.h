@@ -28,6 +28,34 @@ enum kvcache_dict_state {
 
 struct lua_lsm_module;
 
+/*
+ * Immutable, reference-counted string value.  The payload is copied out of
+ * the Lua state (or the securityfs write buffer) at allocation time, so a
+ * node never retains a pointer into a VM stack or a user buffer.  Nodes
+ * only exchange string references; the old value is recycled once the last
+ * concurrent reader drops it (see kvcache_node_store()).
+ */
+struct kvcache_string {
+	atomic_t refcount;
+	size_t len;
+	char data[];
+};
+
+/*
+ * Stable value snapshot for the non-Lua (securityfs) get path.  A string
+ * snapshot owns one reference that must be released with
+ * kvcache_snapshot_put().  lightuserdata values are refused
+ * (-EOPNOTSUPP) so kernel pointers never reach userspace.
+ */
+struct kvcache_snapshot {
+	int tt;
+	union {
+		int b;
+		lua_Number n;
+		struct kvcache_string *s;
+	};
+};
+
 struct kvcache_node {
 	const char *key;
 	struct lua_lsm_module *module;
@@ -39,6 +67,7 @@ struct kvcache_node {
 		int b;
 		lua_Number n;
 		void *p;
+		struct kvcache_string *s;
 	};
 	RB_ENTRY(kvcache_node) node;
 	struct list_head modlist;
@@ -60,6 +89,28 @@ void kvcache_stats_show(struct seq_file *m);
 int kvcache_module_nodes_gc(struct lua_lsm_module *module);
 void kvcache_dict_free(struct kvcache_dict *dict);
 void kvcache_dict_init(struct kvcache_dict *dict);
+
+/************************* non-Lua typed value API ***************************/
+
+/*
+ * Typed setters and the stable snapshot getter used by the securityfs
+ * shdict control file.  They funnel through the same core insert/overwrite
+ * logic as the Lua object/shared-dict paths (kvcache_core_set), so there is
+ * a single copy of the rbtree and locking code.
+ *
+ * Keys are binary-safe (explicit length); strings values may contain NUL.
+ */
+int kvcache_set_bool(struct kvcache_dict *dict, struct lua_lsm_module *module,
+		     const char *key, size_t key_len, bool value);
+int kvcache_set_number(struct kvcache_dict *dict, struct lua_lsm_module *module,
+		       const char *key, size_t key_len, long long value);
+int kvcache_set_string(struct kvcache_dict *dict, struct lua_lsm_module *module,
+		       const char *key, size_t key_len,
+		       const char *value, size_t value_len);
+int kvcache_get_snapshot(struct kvcache_dict *dict,
+			 struct lua_lsm_module *module, const char *key,
+			 struct kvcache_snapshot *snap);
+void kvcache_snapshot_put(struct kvcache_snapshot *snap);
 
 /******************************** object cache *******************************/
 
