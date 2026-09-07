@@ -147,24 +147,11 @@ int lua_lsm_module_unregister(const char *name);
 
 int modules_show(struct seq_file *m, void *v);
 
-/********************* securityfs shared dict wrappers ***********************/
+/********************* securityfs shared dict execution **********************/
 
-/*
- * Module-level shdict access for the securityfs PoC control file.  Each
- * call serializes the module lookup, the shdict lookup and one complete
- * kvcache operation under modules_mutex, and only LIVE modules are ever
- * dereferenced: unknown modules/dicts return -ENOENT and anything not
- * LIVE returns -ESHUTDOWN with the dict left untouched.
- */
-int lua_lsm_shdict_set_bool(const char *module_name, const char *dict_name,
-			    const char *key, bool value);
-int lua_lsm_shdict_set_number(const char *module_name, const char *dict_name,
-			      const char *key, long long value);
-int lua_lsm_shdict_set_string(const char *module_name, const char *dict_name,
-			      const char *key, const char *value,
-			      size_t value_len);
-int lua_lsm_shdict_get(const char *module_name, const char *dict_name,
-		       const char *key, struct kvcache_snapshot *snap);
+int lua_lsm_shdict_exec(const char *module_name, const char *code,
+			size_t code_len, char *result, size_t result_size,
+			size_t *result_len);
 
 #ifdef CONFIG_SECURITY_LUA_LSM_STATS
 void lua_lsm_hook_stats_record(unsigned int nr, u64 delta);

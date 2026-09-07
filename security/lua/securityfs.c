@@ -7,9 +7,6 @@
 
 #include "debug.h"
 #include <linux/security.h>
-#include <linux/kstrtox.h>
-#include <linux/hex.h>
-#include <linux/errname.h>
 #include "lsm.h"
 
 static bool lua_lsm_capable(int cap)
@@ -126,42 +123,20 @@ static const struct file_operations fops_modules = {
  * UNSTABLE: development interface for the securityfs shared dict PoC
  * only.  Not a formal ABI; it may change or disappear without notice.
  *
- * One complete command per write (max SHDICT_IO_MAX bytes), response read
- * back from the same file descriptor.  Each open() allocates an
- * independent response context that release() frees.  Commands:
- *
- *   set <module> <dict> <key> bool <0|1>
- *   set <module> <dict> <key> number <signed decimal integer>
- *   set <module> <dict> <key> string <hexadecimal bytes, even length>
- *   get <module> <dict> <key>
- *
- * Responses:
- *   OK
- *   bool <0|1>
- *   number <signed decimal integer>
- *   string <lowercase hexadecimal bytes>
- *   ERR -<errno>
- *
- * On failure write(2) also returns the negative errno: -EPERM (no
- * CAP_MAC_ADMIN), -EINVAL (format), -E2BIG (over limit), -ENOENT (no
- * such module/dict/key), -ESHUTDOWN (module not LIVE), -EOPNOTSUPP
- * (lightuserdata value), -ENOMEM.
- *
- * The dictionary must already exist: it is created by the Lua policy the
- * first time it touches `shared.<name>`, never by this file.
+ * One complete request per write (max SHDICT_IO_MAX bytes): the first line
+ * names a registered module and the remaining bytes are a Lua chunk. The
+ * chunk runs in a restricted environment that exposes only that module's
+ * `shared` table. Its nil/bool/number/string result is read back from the
+ * same file descriptor; strings are returned as raw bytes.
  */
 #define SHDICT_IO_MAX		4096
 #define SHDICT_NAME_MAX		128
-#define SHDICT_VALUE_MAX	1024
-#define SHDICT_TOKENS_MAX	7
 
 struct shdict_ctx {
 	char *buf;	/* response buffer */
 	size_t len;	/* bytes valid in buf */
 	size_t pos;	/* next byte to return from read() */
 };
-
-static int shdict_exec(struct shdict_ctx *ctx, char *input, size_t len);
 
 static int shdict_open(struct inode *inode, struct file *filp)
 {
@@ -217,7 +192,12 @@ static ssize_t shdict_write(struct file *file, const char __user *buf,
 			    size_t len, loff_t *ppos)
 {
 	struct shdict_ctx *ctx = file->private_data;
+	char *separator;
+	char *code;
 	char *input;
+	size_t module_len;
+	size_t code_len;
+	size_t i;
 	int err;
 
 	if (!lua_lsm_capable(CAP_MAC_ADMIN))
@@ -235,211 +215,47 @@ static ssize_t shdict_write(struct file *file, const char __user *buf,
 	if (IS_ERR(input))
 		return PTR_ERR(input);
 
-	err = shdict_exec(ctx, input, len);
+	/* Lua source uses escapes for NULs; literal NULs are not valid framing. */
+	if (strnlen(input, len) != len) {
+		err = -EINVAL;
+		goto out;
+	}
+
+	separator = memchr(input, '\n', len);
+	if (!separator) {
+		err = -EINVAL;
+		goto out;
+	}
+
+	module_len = separator - input;
+	if (module_len && input[module_len - 1] == '\r')
+		module_len--;
+	if (!module_len || module_len > SHDICT_NAME_MAX) {
+		err = module_len ? -E2BIG : -EINVAL;
+		goto out;
+	}
+	for (i = 0; i < module_len; i++) {
+		if (input[i] <= 0x20 || input[i] == 0x7f) {
+			err = -EINVAL;
+			goto out;
+		}
+	}
+	input[module_len] = '\0';
+
+	code = separator + 1;
+	code_len = len - (code - input);
+	if (!code_len) {
+		err = -EINVAL;
+		goto out;
+	}
+
+	err = lua_lsm_shdict_exec(input, code, code_len, ctx->buf,
+				  SHDICT_IO_MAX, &ctx->len);
+	if (!err)
+		ctx->pos = 0;
+out:
 	kfree(input);
 	return err ?: len;
-}
-
-static int shdict_reply_ok(struct shdict_ctx *ctx)
-{
-	ctx->len = scnprintf(ctx->buf, SHDICT_IO_MAX, "OK\n");
-	ctx->pos = 0;
-	return 0;
-}
-
-static int shdict_reply_value(struct shdict_ctx *ctx, const char *type,
-			      const char *value)
-{
-	ctx->len = scnprintf(ctx->buf, SHDICT_IO_MAX, "%s %s\n", type, value);
-	ctx->pos = 0;
-	return 0;
-}
-
-static int shdict_reply_err(struct shdict_ctx *ctx, int err)
-{
-	ctx->len = scnprintf(ctx->buf, SHDICT_IO_MAX, "ERR %s\n",
-			     errname(err));
-	ctx->pos = 0;
-	return err;
-}
-
-/* Split on ASCII whitespace; returns token count or -1 on overflow. */
-static int shdict_split(char *s, char *tokens[], int max)
-{
-	int n = 0;
-
-	for (;;) {
-		while (*s == ' ' || *s == '\t' || *s == '\n' ||
-		       *s == '\r' || *s == '\v' || *s == '\f')
-			s++;
-		if (!*s)
-			break;
-		if (n == max)
-			return -1;
-		tokens[n++] = s;
-		while (*s && *s != ' ' && *s != '\t' && *s != '\n' &&
-		       *s != '\r' && *s != '\v' && *s != '\f')
-			s++;
-		if (*s)
-			*s++ = '\0';
-	}
-	return n;
-}
-
-static int shdict_name_ok(const char *name)
-{
-	size_t len = strlen(name);
-	size_t i;
-
-	if (len == 0 || len > SHDICT_NAME_MAX)
-		return -E2BIG;
-	for (i = 0; i < len; i++) {
-		/* no whitespace or control characters */
-		if (name[i] <= 0x20 || name[i] == 0x7f)
-			return -EINVAL;
-	}
-	return 0;
-}
-
-static int shdict_exec_set(struct shdict_ctx *ctx, char **t)
-{
-	const char *module = t[1], *dict = t[2], *key = t[3];
-	const char *type = t[4], *value = t[5];
-	char *decoded;
-	size_t value_len;
-	int err;
-
-	err = shdict_name_ok(module);
-	if (!err)
-		err = shdict_name_ok(dict);
-	if (!err)
-		err = shdict_name_ok(key);
-	if (err)
-		return shdict_reply_err(ctx, err);
-
-	if (strcmp(type, "bool") == 0) {
-		if (strcmp(value, "0") == 0)
-			err = lua_lsm_shdict_set_bool(module, dict, key, false);
-		else if (strcmp(value, "1") == 0)
-			err = lua_lsm_shdict_set_bool(module, dict, key, true);
-		else
-			return shdict_reply_err(ctx, -EINVAL);
-	} else if (strcmp(type, "number") == 0) {
-		long long num;
-
-		if (kstrtoll(value, 10, &num))
-			return shdict_reply_err(ctx, -EINVAL);
-		err = lua_lsm_shdict_set_number(module, dict, key, num);
-	} else if (strcmp(type, "string") == 0) {
-		size_t hex_len = strlen(value);
-
-		if (hex_len % 2)
-			return shdict_reply_err(ctx, -EINVAL);
-		value_len = hex_len / 2;
-		if (value_len > SHDICT_VALUE_MAX)
-			return shdict_reply_err(ctx, -E2BIG);
-		decoded = kmalloc(value_len ?: 1, GFP_KERNEL);
-		if (!decoded)
-			return shdict_reply_err(ctx, -ENOMEM);
-		if (hex2bin(decoded, value, value_len))
-			err = -EINVAL;
-		else
-			err = lua_lsm_shdict_set_string(module, dict, key,
-							decoded, value_len);
-		kfree(decoded);
-	} else {
-		return shdict_reply_err(ctx, -EINVAL);
-	}
-
-	if (err)
-		return shdict_reply_err(ctx, err);
-	return shdict_reply_ok(ctx);
-}
-
-static int shdict_exec_get(struct shdict_ctx *ctx, char **t)
-{
-	struct kvcache_snapshot snap;
-	char numbuf[32];
-	char *hex;
-	size_t hex_len;
-	int err;
-
-	err = shdict_name_ok(t[1]);
-	if (!err)
-		err = shdict_name_ok(t[2]);
-	if (!err)
-		err = shdict_name_ok(t[3]);
-	if (err)
-		return shdict_reply_err(ctx, err);
-
-	err = lua_lsm_shdict_get(t[1], t[2], t[3], &snap);
-	if (err)
-		return shdict_reply_err(ctx, err);
-
-	switch (snap.tt) {
-	case LUA_TBOOLEAN:
-		err = shdict_reply_value(ctx, "bool", snap.b ? "1" : "0");
-		break;
-	case LUA_TNUMBER:
-		scnprintf(numbuf, sizeof(numbuf), "%lld", (long long)snap.n);
-		err = shdict_reply_value(ctx, "number", numbuf);
-		break;
-	case LUA_TSTRING:
-		/*
-		 * The response is "string " + hex + '\n'.  Lua-side values
-		 * are not bounded by SHDICT_VALUE_MAX, so refuse values
-		 * whose hex form would not fit the response buffer instead
-		 * of letting scnprintf() truncate them silently.
-		 */
-		if (snap.s->len > (SHDICT_IO_MAX - 9) / 2) {
-			err = shdict_reply_err(ctx, -E2BIG);
-			break;
-		}
-		hex_len = snap.s->len * 2;
-		hex = kmalloc(hex_len + 1, GFP_KERNEL);
-		if (!hex) {
-			err = shdict_reply_err(ctx, -ENOMEM);
-			break;
-		}
-		bin2hex(hex, snap.s->data, snap.s->len);
-		hex[hex_len] = '\0';
-		err = shdict_reply_value(ctx, "string", hex);
-		kfree(hex);
-		break;
-	default:
-		WARN_ON(1);
-		err = shdict_reply_err(ctx, -EINVAL);
-		break;
-	}
-
-	kvcache_snapshot_put(&snap);
-	return err;
-}
-
-static int shdict_exec(struct shdict_ctx *ctx, char *input, size_t len)
-{
-	char *tokens[SHDICT_TOKENS_MAX];
-	int n;
-
-	/* embedded NULs are control characters, not part of the grammar */
-	if (strnlen(input, len) != len)
-		return shdict_reply_err(ctx, -EINVAL);
-
-	n = shdict_split(input, tokens, ARRAY_SIZE(tokens));
-	if (n < 1)
-		return shdict_reply_err(ctx, -EINVAL);
-
-	if (strcmp(tokens[0], "set") == 0) {
-		if (n != 6)
-			return shdict_reply_err(ctx, -EINVAL);
-		return shdict_exec_set(ctx, tokens);
-	}
-	if (strcmp(tokens[0], "get") == 0) {
-		if (n != 4)
-			return shdict_reply_err(ctx, -EINVAL);
-		return shdict_exec_get(ctx, tokens);
-	}
-	return shdict_reply_err(ctx, -EINVAL);
 }
 
 static const struct file_operations fops_shdict = {
