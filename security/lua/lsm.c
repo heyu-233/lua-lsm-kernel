@@ -749,14 +749,16 @@ static int module_load(lua_State *L, struct lua_lsm_module *module)
 	return 0;
 }
 
-int lua_lsm_shdict_exec(const char *module_name, const char *code,
-			size_t code_len, char *result, size_t result_size,
+int lua_lsm_shdict_call(const struct lua_lsm_shdict_request *request,
+			char *result, size_t result_size,
 			size_t *result_len)
 {
 	struct lua_lsm_module *module;
 	lua_State *L;
+	const char *method;
 	const char *value;
 	size_t value_len;
+	int nargs;
 	int top;
 	int found = 0;
 	int err = -ENOENT;
@@ -773,7 +775,7 @@ int lua_lsm_shdict_exec(const char *module_name, const char *code,
 	 */
 	mutex_lock(&modules_mutex);
 	list_for_each_entry(module, &lsm_modules, list) {
-		if (strcmp(module->name, module_name) == 0) {
+		if (strcmp(module->name, request->module) == 0) {
 			found = 1;
 			break;
 		}
@@ -785,21 +787,75 @@ int lua_lsm_shdict_exec(const char *module_name, const char *code,
 		goto out;
 	}
 
-	module_env_push(L, module, true);	/* restricted env */
-	err = luaL_loadbuffer_wrap(L, code, code_len, "<lua-lsm:shdict>");
-	if (err)
+	/* Resolve shared.<dict> in the same restricted module environment used by
+	 * the previous PoC, but invoke the existing method directly instead of
+	 * compiling user-provided Lua source.
+	 */
+	module_env_push(L, module, true);
+	lua_getfield(L, -1, "shared");
+	lua_pushstring(L, request->dict);
+	lua_gettable(L, -2);
+	if (lua_type(L, -1) != LUA_TUSERDATA) {
+		err = -ENOMEM;
 		goto out;
+	}
 
-	/* stack: [env, chunk] */
-	lua_pushvalue(L, -2);
-	lua_setfenv(L, -2);
-	err = lua_pcall_wrap(L, 0, 1, 0);
+	switch (request->op) {
+	case LUA_LSM_SHDICT_SET:
+	case LUA_LSM_SHDICT_DELETE:
+		method = "set";
+		nargs = 3;
+		break;
+	case LUA_LSM_SHDICT_GET:
+		method = "get";
+		nargs = 2;
+		break;
+	case LUA_LSM_SHDICT_INCR:
+		method = "incr";
+		nargs = 3;
+		break;
+	default:
+		err = -EINVAL;
+		goto out;
+	}
+
+	lua_getfield(L, -1, method);
+	if (!lua_isfunction(L, -1)) {
+		err = -EIO;
+		goto out;
+	}
+	lua_pushvalue(L, -2);		/* self: shared.<dict> */
+	lua_pushstring(L, request->key);
+
+	if (request->op == LUA_LSM_SHDICT_DELETE) {
+		lua_pushnil(L);
+	} else if (request->op == LUA_LSM_SHDICT_INCR) {
+		lua_pushnumber(L, request->value.number);
+	} else if (request->op == LUA_LSM_SHDICT_SET) {
+		switch (request->type) {
+		case LUA_LSM_SHDICT_BOOLEAN:
+			lua_pushboolean(L, request->value.boolean);
+			break;
+		case LUA_LSM_SHDICT_NUMBER:
+			lua_pushnumber(L, request->value.number);
+			break;
+		case LUA_LSM_SHDICT_STRING:
+			lua_pushlstring(L, request->value.string.data,
+					request->value.string.len);
+			break;
+		default:
+			err = -EINVAL;
+			goto out;
+		}
+	}
+
+	err = lua_pcall_wrap(L, nargs, 1, 0);
 	if (err)
 		goto out;
 
 	switch (lua_type(L, -1)) {
 	case LUA_TNIL:
-		err = 0;
+		err = request->op == LUA_LSM_SHDICT_GET ? 0 : -EINVAL;
 		break;
 	case LUA_TBOOLEAN:
 		value = lua_toboolean(L, -1) ? "true" : "false";
@@ -826,6 +882,55 @@ out:
 	lua_settop(L, top);
 	mutex_unlock(&modules_mutex);
 	lvm_put(L);
+	return err;
+}
+
+int lua_lsm_shdict_dump(char *buf, size_t size, size_t *result_len)
+{
+	struct lua_lsm_module_shdict **dicts;
+	struct lua_lsm_module_shdict *shdict;
+	struct lua_lsm_module *module;
+	unsigned long flags;
+	size_t count;
+	size_t i;
+	int err = 0;
+
+	*result_len = 0;
+	mutex_lock(&modules_mutex);
+	list_for_each_entry(module, &lsm_modules, list) {
+		if (module->state != LMS_STATE_LIVE)
+			continue;
+
+		count = atomic_read(&module->shdict_count);
+		if (!count)
+			continue;
+		dicts = kmalloc_array(count, sizeof(*dicts), GFP_KERNEL);
+		if (!dicts) {
+			err = -ENOMEM;
+			break;
+		}
+
+		i = 0;
+		spin_lock_irqsave(&module->shdict_lock, flags);
+		list_for_each_entry(shdict, &module->shdicts, list) {
+			if (i == count)
+				break;
+			dicts[i++] = shdict;
+		}
+		spin_unlock_irqrestore(&module->shdict_lock, flags);
+		count = i;
+
+		for (i = 0; i < count; i++) {
+			err = kvcache_dump(&dicts[i]->dict, module->name,
+					   dicts[i]->name, buf, size, result_len);
+			if (err)
+				break;
+		}
+		kfree(dicts);
+		if (err)
+			break;
+	}
+	mutex_unlock(&modules_mutex);
 	return err;
 }
 

@@ -610,6 +610,151 @@ void kvcache_dict_init(struct kvcache_dict *dict)
 	atomic_set_release(&dict->state, KVCACHE_DICT_READY);
 }
 
+static int kvcache_dump_append(char *buf, size_t size, size_t *pos,
+			       const char *value, size_t len)
+{
+	size_t i;
+
+	for (i = 0; i < len; i++) {
+		unsigned char c = value[i];
+
+		if (c >= 0x20 && c < 0x7f && c != '\\') {
+			if (*pos + 1 >= size)
+				return -E2BIG;
+			buf[(*pos)++] = c;
+			continue;
+		}
+
+		if (*pos + 4 >= size)
+			return -E2BIG;
+		*pos += scnprintf(buf + *pos, size - *pos, "\\x%02x", c);
+	}
+	return 0;
+}
+
+/*
+ * Append a stable, text-safe snapshot of one shared dictionary.  Node
+ * references are collected under the tree lock so formatting never holds the
+ * dictionary lock.  Individual value locks protect replacement while a line
+ * is copied to the output buffer.
+ */
+int kvcache_dump(struct kvcache_dict *dict, const char *module_name,
+		 const char *dict_name, char *buf, size_t size, size_t *pos)
+{
+	struct kvcache_node **nodes;
+	struct kvcache_node *node;
+	struct kvcache_node value;
+	unsigned long flags;
+	size_t capacity;
+	size_t count = 0;
+	size_t i;
+	int err = 0;
+	int n;
+
+	if (!kvcache_dict_ready(dict) || !atomic_read(&dict->count))
+		return 0;
+
+	capacity = dict->capacity;
+	nodes = kmalloc_array(capacity, sizeof(*nodes), GFP_KERNEL);
+	if (!nodes)
+		return -ENOMEM;
+
+	read_lock_irqsave(&dict->lock, flags);
+	RB_FOREACH(node, kvcache, &dict->root) {
+		if (count == capacity)
+			break;
+		kvcache_node_hold(node);
+		nodes[count++] = node;
+	}
+	read_unlock_irqrestore(&dict->lock, flags);
+
+	for (i = 0; i < count; i++) {
+		node = nodes[i];
+		err = kvcache_dump_append(buf, size, pos, module_name,
+					  strlen(module_name));
+		if (err)
+			goto out;
+		if (*pos + 1 >= size) {
+			err = -E2BIG;
+			goto out;
+		}
+		buf[(*pos)++] = ' ';
+		err = kvcache_dump_append(buf, size, pos, dict_name,
+					  strlen(dict_name));
+		if (err)
+			goto out;
+		if (*pos + 1 >= size) {
+			err = -E2BIG;
+			goto out;
+		}
+		buf[(*pos)++] = ' ';
+		err = kvcache_dump_append(buf, size, pos, node->key,
+					  strlen(node->key));
+		if (err)
+			goto out;
+
+		value.tt = LUA_TNIL;
+		read_lock_irqsave(&node->lock, flags);
+		kvcache_node_copy(&value, node);
+		read_unlock_irqrestore(&node->lock, flags);
+
+		switch (value.tt) {
+		case LUA_TBOOLEAN:
+			n = snprintf(buf + *pos, size - *pos, " boolean %s\n",
+				     value.b ? "true" : "false");
+			break;
+		case LUA_TNUMBER:
+			n = snprintf(buf + *pos, size - *pos, " number %lld\n",
+				     (long long)value.n);
+			break;
+		case LUA_TSTRING:
+			n = snprintf(buf + *pos, size - *pos, " string ");
+			if (n < 0 || n >= size - *pos) {
+				err = -E2BIG;
+				break;
+			}
+			*pos += n;
+			err = kvcache_dump_append(buf, size, pos, value.s->data,
+						  value.s->len);
+			if (!err) {
+				if (*pos + 1 >= size)
+					err = -E2BIG;
+				else
+					buf[(*pos)++] = '\n';
+			}
+			n = 0;
+			break;
+		case LUA_TLIGHTUSERDATA:
+			n = snprintf(buf + *pos, size - *pos,
+				     " lightuserdata <hidden>\n");
+			break;
+		default:
+			n = -EINVAL;
+			break;
+		}
+		if (value.tt == LUA_TSTRING)
+			kvcache_string_drop(value.s);
+
+		if (err)
+			goto out;
+		if (n < 0) {
+			err = n;
+			goto out;
+		}
+		if (n >= size - *pos) {
+			err = -E2BIG;
+			goto out;
+		}
+		*pos += n;
+	}
+
+out:
+	for (i = 0; i < count; i++)
+		kvcache_node_drop(nodes[i]);
+	kfree(nodes);
+	return err;
+}
+
 /******************************** object cache *******************************/
 
 const int _module_sentinel;
