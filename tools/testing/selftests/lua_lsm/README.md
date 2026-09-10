@@ -1,94 +1,99 @@
-# Lua-LSM shared-dictionary Lua interface PoC
+# Lua-LSM shared-dictionary text interface PoC
 
 This PoC exposes the existing Lua shared-dictionary API through
-`/sys/kernel/security/lua/shdict`. It does not define a second typed C API
-or require a dedicated userspace client.
+`/sys/kernel/security/lua/shdict`. It does not define a second typed kvcache
+API or require a dedicated userspace client.
 
 The end-to-end path is:
 
-```
-userspace Lua request -> securityfs -> restricted module environment ->
+```text
+userspace text command -> securityfs parser -> Lua call bridge ->
 shared.<dict>:set/get/incr -> kvcache -> Lua LSM hook
 ```
 
 ## Request format
 
-Each write contains a module name on the first line and one Lua chunk in the
-remaining bytes:
+Each write contains one line-oriented request of at most 4096 bytes:
 
 ```text
-demo
-return shared.runtime:set("blocked_path", "/tmp/blocked")
+set <module> <dict> <key> <boolean|number|string|hex> <value>
+get <module> <dict> <key>
+delete <module> <dict> <key>
+incr <module> <dict> <key> [delta]
 ```
 
-```text
-demo
-return shared.runtime:get("blocked_path")
-```
-
-Open the file once when a result is needed, because the result is read back
-from the same file description:
+For normal administration, change to the Lua-LSM securityfs directory and
+write readable commands directly:
 
 ```sh
-exec 3<>/sys/kernel/security/lua/shdict
-printf '%s\n%s\n' demo \
-  'return shared.runtime:set("blocked_path", "/tmp/blocked")' >&3
-cat <&3
-
-printf '%s\n%s\n' demo \
-  'return shared.runtime:get("blocked_path")' >&3
-cat <&3
+cd /sys/kernel/security/lua
+echo 'set demo runtime blocked_path string /tmp/blocked' > shdict
+cat shdict
+grep '^demo runtime blocked_path ' shdict
+echo 'delete demo runtime blocked_path' > shdict
 ```
 
-The execution environment exposes only `shared` for the selected module.
-It does not expose `current`, `require`, `_G`, or the policy module
-table. Access to the file requires `CAP_MAC_ADMIN` and its mode is `0600`.
+A fresh read enumerates every key in every named dictionary belonging to a
+LIVE module. Each line has this format:
 
-Successful scalar results are returned without type tags:
+```text
+<module> <dict> <key> <type> <escaped-value>
+```
 
-- `nil`: empty result
-- boolean: `true` or `false`
-- number: Lua's decimal representation
-- string: exact raw bytes, including embedded NULs
+Strings use readable text directly. Backslashes and non-printable bytes are
+escaped as `\xNN` in enumeration output. The `hex` input type is available for
+binary-safe strings such as an embedded NUL:
 
-Other result types fail with `-EOPNOTSUPP`. Invalid framing, syntax errors,
-runtime errors, unknown modules, non-LIVE modules, and oversized requests are
-reported through the failing `write(2)`.
+```sh
+echo 'set demo runtime binary_key hex 610062' > shdict
+```
+
+Programs that need one exact result can keep the file descriptor open and
+read the result of `set`, `get`, `delete`, or `incr` from that same open file.
+This keeps request results per-open instead of exposing a racy global
+"last-result" slot.
+
+The file mode is `0600`; open and every read/write also require
+`CAP_MAC_ADMIN`. The parser never evaluates userspace-provided Lua source.
+The bridge constructs a restricted module environment internally and invokes
+the existing shared-dictionary methods by using the Lua C API.
 
 ## Reproduction
 
 ```sh
-# Build in the linux-dev VM
 make -C /home/maomao-wang/work/lua-lsm/kernel \
   O=/home/maomao-wang/work/lua-lsm/out-riscv \
   ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- -j4 Image
 
-# Copy shdict_poc.{lua,sh} and run-all.sh into the initramfs tests directory,
-# repack the initramfs, and boot the automated QEMU runner.
 /home/maomao-wang/work/lua-lsm/scripts/run-qemu.sh
 ```
 
 `shdict_poc.sh` verifies:
 
-1. bool, number, string, embedded-NUL, overwrite, delete, and `incr`
+1. boolean, number, string, embedded-NUL, overwrite, delete, and `incr`
 2. dictionary creation on first `shared.<name>` access
-3. the restricted execution environment
+3. enumeration across named dictionaries with safe value escaping
 4. live updates to `blocked_path` changing a real `file_open` decision
-5. unknown modules, Lua errors, unsupported results, and input limits
+5. malformed commands, unknown modules, unsupported types, and input limits
 6. open-time and per-operation `CAP_MAC_ADMIN` enforcement
 7. repeated requests without Lua stack contamination
 8. rejection of requests after the target module leaves LIVE state
 
-The boot log must contain no Lua traceback outside intentional negative tests,
-BUG, WARNING, or reference-count assertion.
+The boot log must contain no unexpected Lua traceback, BUG, WARNING, or
+reference-count assertion.
+
+`shdict_stress.sh` additionally runs two writers and two enumeration/hook
+readers in parallel, verifies the final atomic counter, and unregisters the
+module after all workers exit.
 
 ## Implementation boundary
 
 - The string extension remains inside the original kvcache Lua path. String
   payloads are copied, length-aware, immutable, and reference-counted.
-- securityfs parses only the module-name framing; Lua parses and executes the
-  dictionary operation.
-- The target module and its dictionaries remain protected for the complete Lua
-  call. `lvm_get()` runs before the module lifecycle lock and every exit path
-  restores the Lua stack and releases both resources.
-- The interface is a development PoC, not a stable userspace ABI.
+- securityfs parses only the public text grammar. It does not directly insert,
+  overwrite, or remove kvcache nodes.
+- The bridge pushes structured arguments onto the Lua stack and calls the
+  original `shared` methods; it does not compile user-supplied Lua code.
+- The target module and its dictionaries remain protected for the complete
+  call. Every exit path restores the Lua stack and releases all resources.
+- The interface remains a development PoC, not a stable userspace ABI.

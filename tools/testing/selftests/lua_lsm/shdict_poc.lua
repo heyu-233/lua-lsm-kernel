@@ -1,11 +1,11 @@
 -- SPDX-License-Identifier: GPL-2.0
 --
--- securityfs shared-dictionary Lua execution PoC policy.
+-- securityfs shared-dictionary text-interface PoC policy.
 --
 -- The file_open hook reads shared.runtime.blocked_path on every open and
 -- denies access when the opened path equals the configured string. The
--- /sys/kernel/security/lua/shdict control file executes the existing
--- shared.runtime Lua API in this module's restricted shared environment.
+-- /sys/kernel/security/lua/shdict parses a compact userspace command and
+-- invokes the existing shared.runtime Lua API through an internal bridge.
 --
 -- The hook additionally:
 --   * stores a real kernel lightuserdata under "ptr", so the securityfs

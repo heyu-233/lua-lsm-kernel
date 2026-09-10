@@ -1,8 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0
-#
-# Lua-LSM shared-dictionary Lua execution PoC.
-# Request format: first line is the module name, remaining bytes are Lua.
+# Lua-LSM shared-dictionary text-interface PoC.
 
 set -u
 
@@ -17,44 +15,40 @@ RESP_FILE=/tmp/shdict-response
 ok()  { PASS=$((PASS + 1)); echo "PASS: $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "FAIL: $1"; }
 
-# Write one request and read its raw result from the same open file.
-lua_send() {
-	module=$1
-	code=$2
-	if ! printf '%s\n%s\n' "$module" "$code" >&3 2>/dev/null; then
+# Request results remain per-open. A fresh open reads the enumeration snapshot.
+send() {
+	command=$1
+	if ! printf '%s\n' "$command" >&3 2>/dev/null; then
 		resp=
 		return 1
 	fi
 	resp=$(cat <&3)
-	return 0
 }
 
-lua_send_file() {
-	module=$1
-	code=$2
-	if ! printf '%s\n%s\n' "$module" "$code" >&3 2>/dev/null; then
+send_file() {
+	command=$1
+	if ! printf '%s\n' "$command" >&3 2>/dev/null; then
 		: > "$RESP_FILE"
 		return 1
 	fi
 	cat <&3 > "$RESP_FILE"
 }
 
-lua_expect() {
+expect() {
 	expected=$1
-	code=$2
+	command=$2
 	description=$3
-	if lua_send "$MODULE" "$code" && [ "$resp" = "$expected" ]; then
+	if send "$command" && [ "$resp" = "$expected" ]; then
 		ok "$description"
 	else
 		bad "$description (expected '$expected', got '$resp')"
 	fi
 }
 
-lua_must_fail() {
-	module=$1
-	code=$2
-	description=$3
-	if lua_send "$module" "$code"; then
+must_fail() {
+	command=$1
+	description=$2
+	if send "$command"; then
 		bad "$description (request unexpectedly succeeded)"
 	else
 		ok "$description"
@@ -68,7 +62,7 @@ make_a_run() {
 	done
 }
 
-echo "== Lua-LSM shared dictionary Lua interface PoC =="
+echo "== Lua-LSM shared dictionary text interface PoC =="
 [ -f "$POLICY" ] || { bad "policy $POLICY not found"; exit 1; }
 [ -w "$SHDICT" ] || { bad "$SHDICT missing"; exit 1; }
 
@@ -76,38 +70,48 @@ cat "$POLICY" > "$BASE/register" || { bad "module register failed"; exit 1; }
 ok "module registered"
 exec 3<>"$SHDICT" || { bad "cannot open $SHDICT"; exit 1; }
 
-echo "-- 1. direct Lua set/get and on-demand dictionary creation --"
-lua_expect true 'return shared.runtime:set("flag", true)' "set bool through Lua API"
-lua_expect true 'return shared.runtime:get("flag")' "get bool through Lua API"
-lua_expect true 'return shared.runtime:set("number", 42)' "set number through Lua API"
-lua_expect 42 'return shared.runtime:get("number")' "get number through Lua API"
-lua_expect true 'return shared.runtime:set("message", "hello world")' "set plain string"
-lua_expect "hello world" 'return shared.runtime:get("message")' "get plain string"
-lua_expect 2 'return shared.runtime:incr("counter", 2)' "incr creates a counter"
-lua_expect 3 'return shared.runtime:incr("counter")' "incr updates a counter"
+echo "-- 1. set/get and on-demand dictionary creation --"
+expect true "set $MODULE runtime flag boolean true" "set boolean"
+expect true "get $MODULE runtime flag" "get boolean"
+expect true "set $MODULE runtime number number 42" "set number"
+expect 42 "get $MODULE runtime number" "get number"
+expect true "set $MODULE runtime message string hello world" \
+	"set plain string with spaces"
+expect "hello world" "get $MODULE runtime message" "get plain string"
+expect true "set $MODULE config empty string " "set empty string"
+expect "" "get $MODULE config empty" "get empty string"
 
-echo "-- 2. binary-safe strings, overwrite and delete --"
-lua_expect true 'return shared.runtime:set("probe_expected", "a\0b")' "set embedded-NUL string"
-if lua_send_file "$MODULE" 'return shared.runtime:get("probe_expected")'; then
+echo "-- 2. incr, overwrite, delete and binary-safe strings --"
+expect 2 "incr $MODULE runtime counter 2" "incr creates counter"
+expect 3 "incr $MODULE runtime counter" "incr defaults to one"
+expect true "set $MODULE runtime message string new" "overwrite string"
+expect new "get $MODULE runtime message" "overwritten value visible"
+expect true "delete $MODULE runtime message" "delete key"
+expect "" "get $MODULE runtime message" "deleted key is absent"
+expect true "set $MODULE runtime probe_expected hex 610062" \
+	"set embedded-NUL string with hex"
+if send_file "get $MODULE runtime probe_expected"; then
 	hex=$(od -An -tx1 "$RESP_FILE" | tr -d ' \n')
-	[ "$hex" = 610062 ] && ok "embedded-NUL string returned intact" || \
+	[ "$hex" = 610062 ] && ok "embedded-NUL returned intact" || \
 		bad "embedded-NUL result (expected 610062, got $hex)"
 else
 	bad "get embedded-NUL string"
 fi
-lua_expect true 'return shared.runtime:set("message", "new")' "overwrite string"
-lua_expect new 'return shared.runtime:get("message")' "overwritten value visible"
-lua_expect true 'return shared.runtime:set("message", nil)' "delete with nil"
-lua_expect true 'return shared.runtime:get("message") == nil' "deleted key is absent"
 
-echo "-- 3. restricted execution environment --"
-lua_expect true 'return current == nil' "current is not exposed"
-lua_expect true 'return require == nil' "require is not exposed"
-lua_expect true 'return _G == nil' "global environment is not exposed"
+echo "-- 3. enumeration snapshot --"
+snapshot=$(cat "$SHDICT")
+echo "$snapshot" | grep -Fqx "demo runtime flag boolean true" && \
+	ok "enumerate boolean" || bad "enumerate boolean"
+echo "$snapshot" | grep -Fqx "demo runtime number number 42" && \
+	ok "enumerate number" || bad "enumerate number"
+echo "$snapshot" | grep -Fqx 'demo runtime probe_expected string a\x00b' && \
+	ok "enumeration escapes embedded NUL" || bad "enumeration escapes embedded NUL"
+echo "$snapshot" | grep -Fqx "demo config empty string " && \
+	ok "enumerate second named dictionary" || bad "enumerate second named dictionary"
 
 echo "-- 4. dynamic file-access decision --"
 touch /tmp/blocked /tmp/blocked2 /tmp/plain || { bad "touch fixtures"; exit 1; }
-lua_expect true 'return shared.runtime:set("blocked_path", "/tmp/blocked")' \
+expect true "set $MODULE runtime blocked_path string /tmp/blocked" \
 	"configure /tmp/blocked"
 if cat /tmp/blocked > /dev/null 2>&1; then
 	bad "open /tmp/blocked should be denied"
@@ -116,7 +120,7 @@ else
 fi
 cat /tmp/plain > /dev/null 2>&1 && ok "unmatched path allowed" || \
 	bad "unmatched path should be allowed"
-lua_expect true 'return shared.runtime:set("blocked_path", "/tmp/blocked2")' \
+expect true "set $MODULE runtime blocked_path string /tmp/blocked2" \
 	"update policy without reload"
 cat /tmp/blocked > /dev/null 2>&1 && ok "old path allowed after update" || \
 	bad "old path should be allowed after update"
@@ -126,37 +130,30 @@ else
 	ok "new path denied after update"
 fi
 
-echo "-- 5. Lua result and error boundaries --"
+echo "-- 5. value and parser boundaries --"
 cat /proc/version > /dev/null
-lua_expect false 'return shared.runtime:get("probe_mismatch")' \
+expect false "get $MODULE runtime probe_mismatch" \
 	"hook reads embedded-NUL value consistently"
-lua_must_fail "$MODULE" 'return shared.runtime:get("ptr")' \
-	"lightuserdata result is refused"
-lua_must_fail nosuch 'return shared.runtime:get("flag")' "unknown module is refused"
-lua_must_fail "$MODULE" 'return shared.runtime:get(' "syntax error is refused"
-lua_must_fail "$MODULE" 'return shared.runtime:no_such_method()' \
-	"runtime error is refused"
-lua_must_fail "$MODULE" 'return {}' "non-scalar result is refused"
-lua_expect true 'return shared.runtime:set("probe_long_requested", true)' \
-	"request an overlong Lua result"
-cat /proc/version > /dev/null
-lua_must_fail "$MODULE" 'return shared.runtime:get("probe_long")' \
-	"result over 4096 bytes is refused"
+snapshot=$(cat "$SHDICT")
+echo "$snapshot" | grep -Fqx "demo runtime ptr lightuserdata <hidden>" && \
+	ok "lightuserdata address is hidden" || bad "lightuserdata address is hidden"
+must_fail "get nosuch runtime flag" "unknown module is refused"
+must_fail "set $MODULE runtime bad boolean maybe" "invalid boolean is refused"
+must_fail "set $MODULE runtime bad number 1x" "invalid number is refused"
+must_fail "set $MODULE runtime bad table value" "unsupported type is refused"
+must_fail "set $MODULE runtime bad hex 123" "odd-length hex is refused"
+must_fail "get $MODULE runtime flag extra" "extra get argument is refused"
+must_fail "unknown $MODULE runtime flag" "unknown operation is refused"
 
 make_a_run 256
-lua_must_fail "$a_run" 'return true' "module name over 128 bytes is refused"
-if printf '%s' "$MODULE" >&3 2>/dev/null; then
-	bad "request without module separator should fail"
+must_fail "get $a_run runtime flag" "module name over 128 bytes is refused"
+if printf 'get demo\nruntime flag\n' >&3 2>/dev/null; then
+	bad "multi-line request should fail"
 else
-	ok "request without module separator fails"
-fi
-if printf '%s\n' "$MODULE" >&3 2>/dev/null; then
-	bad "request without Lua code should fail"
-else
-	ok "request without Lua code fails"
+	ok "multi-line request fails"
 fi
 make_a_run 8192
-if printf '%s\nreturn "%s"\n' "$MODULE" "$a_run" >&3 2>/dev/null; then
+if printf 'set demo runtime long string %s\n' "$a_run" >&3 2>/dev/null; then
 	bad "request over 4096 bytes should fail"
 else
 	ok "request over 4096 bytes fails"
@@ -170,26 +167,26 @@ else
 	ok "unprivileged open denied"
 fi
 if setpriv --reuid 1000 --regid 1000 --clear-groups sh -c \
-	'printf "demo\nreturn true\n" >&3' 2>/dev/null; then
+	'printf "get demo runtime flag\n" >&3' 2>/dev/null; then
 	bad "unprivileged write on inherited fd should fail"
 else
 	ok "per-operation capability check enforced"
 fi
 
-echo "-- 7. repeated execution and Lua stack cleanup --"
+echo "-- 7. repeated calls and Lua stack cleanup --"
 i=1
 repeat_ok=1
 while [ "$i" -le 100 ]; do
-	if ! lua_send "$MODULE" "return shared.runtime:set(\"repeat\", $i)" || \
+	if ! send "set $MODULE runtime repeat number $i" || \
 	   [ "$resp" != true ]; then
 		repeat_ok=0
 		break
 	fi
 	i=$((i + 1))
 done
-[ "$repeat_ok" -eq 1 ] && ok "100 repeated Lua requests" || \
-	bad "repeated Lua request $i"
-lua_expect 100 'return shared.runtime:get("repeat")' "stack remains usable"
+[ "$repeat_ok" -eq 1 ] && ok "100 repeated requests" || \
+	bad "repeated request $i"
+expect 100 "get $MODULE runtime repeat" "Lua stack remains usable"
 
 echo "-- 8. module lifecycle boundary --"
 sh -c ': > /dev/null; while :; do :; done' &
@@ -200,8 +197,7 @@ if printf '%s\n' "$MODULE" > "$BASE/unregister" 2>/dev/null; then
 else
 	ok "busy unregister refused"
 fi
-lua_must_fail "$MODULE" 'return shared.runtime:get("flag")' \
-	"non-LIVE module is refused"
+must_fail "get $MODULE runtime flag" "non-LIVE module is refused"
 kill "$spin" 2>/dev/null
 wait "$spin" 2>/dev/null
 
