@@ -1,16 +1,15 @@
 -- SPDX-License-Identifier: GPL-2.0
 --
--- securityfs shared dict get/set PoC policy.
+-- securityfs shared-dictionary text-interface PoC policy.
 --
 -- The file_open hook reads shared.runtime.blocked_path on every open and
--- denies access when the opened path equals the configured string.  The
--- first hook dispatch also creates the "runtime" shared dict, which the
--- /sys/kernel/security/lua/shdict control file can then reach via the
--- module name "demo".
+-- denies access when the opened path equals the configured string. The
+-- /sys/kernel/security/lua/shdict parses a compact userspace command and
+-- invokes the existing shared.runtime Lua API through an internal bridge.
 --
 -- The hook additionally:
 --   * stores a real kernel lightuserdata under "ptr", so the securityfs
---     get path must refuse to export it (-EOPNOTSUPP) instead of leaking
+--     result path must refuse to export it (-EOPNOTSUPP) instead of leaking
 --     the kernel address.  The module environment is keyed by a raw
 --     lightuserdata (the same &_module_sentinel used as MODULE_KEY), so
 --     the policy harvests it with getfenv(1) + pairs();
@@ -19,8 +18,7 @@
 --     against the literal "a\0b" and the result is published back under
 --     "probe_mismatch");
 --   * one-shot probes for delete (probe_del_requested -> probe_del = nil)
---     and for a Lua-side overlong string (probe_long_requested ->
---     probe_long, 4096 bytes) that get must refuse with -E2BIG.
+--     and for an overlong result (probe_long_requested -> probe_long).
 --
 -- Diagnostic keys written on every dispatch (readable via shdict):
 --   probe_env_n       number of raw keys in the hook environment
@@ -30,7 +28,7 @@
 return {
   name = "demo",
   author = "OSPP",
-  description = "securityfs shared dict get/set PoC",
+  description = "securityfs shared dict Lua execution PoC",
   license = "GPL-2.0",
   version = 3,
 
@@ -60,10 +58,10 @@ return {
     end
 
     -- one-shot probe: store a Lua-side string longer than the securityfs
-    -- response buffer (4096 bytes); get must refuse it with -E2BIG
+    -- response buffer; returning it must fail with -E2BIG
     if runtime.probe_long_requested then
       local long = ""
-      for i = 1, 4096 do
+      for i = 1, 4097 do
         long = long .. "z"
       end
       runtime.probe_long = long

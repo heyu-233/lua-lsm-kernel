@@ -7,7 +7,7 @@
 # in the lua-lsm QEMU development initramfs (see README.md for the repro
 # instructions).
 
-TEST_PROGS := shdict_poc.sh
-TEST_FILES := shdict_poc.lua
+TEST_PROGS := shdict_poc.sh shdict_stress.sh
+TEST_FILES := shdict_poc.lua shdict_stress.lua
 
 include ../lib.mk

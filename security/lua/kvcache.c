@@ -356,84 +356,22 @@ kvcache_node_copy(struct kvcache_node *node, struct kvcache_node *src)
 	}
 }
 
-/*
- * Replace the value of an already-published node.  Strings are immutable
- * and exchanged by reference: the store drops the old reference and the
- * caller drops the temporary one, so a concurrent reader that already
- * holds the old string keeps it alive until it finishes.
- */
-static void kvcache_node_store(struct kvcache_node *node,
-			       struct kvcache_node *src)
+static int kvcache_node_refill(lua_State *L, int idx,
+			       struct kvcache_node *node)
 {
+	struct kvcache_node ntmp = { .tt = LUA_TNIL };
 	unsigned long flags;
-
-	write_lock_irqsave(&node->lock, flags);
-	kvcache_node_clear(node);
-	kvcache_node_copy(node, src);
-	write_unlock_irqrestore(&node->lock, flags);
-}
-
-/*
- * Core node insert/overwrite/delete shared by the Lua entry points
- * (kvcache_set) and the securityfs typed setters.  `value` owns its
- * references (a string holds exactly one); the caller clears it with
- * kvcache_node_clear() afterwards so exactly one reference ends up in
- * the published node.
- */
-static int kvcache_core_set(struct kvcache_dict *dict,
-			    struct lua_lsm_module *module,
-			    const char *key, size_t len,
-			    struct kvcache_node *value)
-{
-	struct kvcache_node *node, *prev;
 	int err;
 
-	err = kvcache_dict_init_once(dict);
+	err = kvcache_node_fill(L, idx, &ntmp);
 	if (err)
 		return err;
 
-	node = kvcache_lookup(dict, module, key);
-	if (!node) {
-		/* setting nil on an absent key is a no-op */
-		if (value->tt == LUA_TNIL)
-			return 0;
-
-		node = kvcache_node_alloc(dict, module, key, len);
-		if (!node)
-			return -ENOMEM;
-
-		kvcache_node_store(node, value);
-
-		prev = kvcache_module_link(dict, module, node);
-		if (prev) {
-			kvcache_node_clear(node);
-			kvcache_node_free(node);
-
-			if (IS_ERR(prev))
-				return PTR_ERR(prev);
-
-			/* a concurrent insert won the race: update it */
-			kvcache_node_store(prev, value);
-			kvcache_node_drop(prev);
-		}
-		return 0;
-	}
-
-	if (value->tt == LUA_TNIL) {
-		/*
-		 * Delete: the node carries both the tree's reference (taken
-		 * at insert) and the reference kvcache_lookup() took.  Unlink
-		 * first, then release both so the node (and its string value)
-		 * is recycled once concurrent readers are done with it.
-		 */
-		kvcache_module_unlink(dict, module, node);
-		kvcache_node_drop(node);	/* kvcache_lookup() hold */
-		kvcache_node_drop(node);	/* tree reference */
-		return 0;
-	}
-
-	kvcache_node_store(node, value);
-	kvcache_node_drop(node);
+	write_lock_irqsave(&node->lock, flags);
+	kvcache_node_clear(node);
+	kvcache_node_copy(node, &ntmp);
+	write_unlock_irqrestore(&node->lock, flags);
+	kvcache_node_clear(&ntmp);
 	return 0;
 }
 
@@ -442,22 +380,55 @@ static int kvcache_set(lua_State *L, struct kvcache_dict *dict,
 {
 	size_t len;
 	const char *key = luaL_checklstring(L, 2, &len);
-	struct kvcache_node value;
+	int tt = lua_type(L, 3);
+	struct kvcache_node *node, *prev;
 	int err;
 
-	if (lua_type(L, 3) == LUA_TNIL) {
-		value.tt = LUA_TNIL;
-	} else {
-		err = kvcache_node_fill(L, 3, &value);
-		if (err)
-			return kvcache_result(L, err);
-	}
-
-	err = kvcache_core_set(dict, module, key, len, &value);
-	kvcache_node_clear(&value);
+	err = kvcache_dict_init_once(dict);
 	if (err)
 		return kvcache_result(L, err);
 
+	node = kvcache_lookup(dict, module, key);
+	if (!node) {
+		if (tt == LUA_TNIL)
+			goto ret;
+
+		node = kvcache_node_alloc(dict, module, key, len);
+		if (!node)
+			return kvcache_result(L, -ENOMEM);
+
+		err = kvcache_node_fill(L, 3, node);
+		if (err) {
+			kvcache_node_free(node);
+			return kvcache_result(L, err);
+		}
+
+		prev = kvcache_module_link(dict, module, node);
+		if (prev) {
+			kvcache_node_free(node);
+
+			if (IS_ERR(prev))
+				return kvcache_result(L, PTR_ERR(prev));
+
+			err = kvcache_node_refill(L, 3, prev);
+			kvcache_node_drop(prev);
+			if (err)
+				return kvcache_result(L, err);
+		}
+	} else {
+		if (tt == LUA_TNIL) {
+			kvcache_module_unlink(dict, module, node);
+			kvcache_node_drop(node);	/* lookup reference */
+			kvcache_node_drop(node);	/* tree reference */
+		} else {
+			err = kvcache_node_refill(L, 3, node);
+			kvcache_node_drop(node);
+			if (err)
+				return kvcache_result(L, err);
+		}
+	}
+
+ret:
 	lua_pushboolean(L, 1);
 	return 1;
 }
@@ -506,106 +477,6 @@ static int kvcache_get(lua_State *L, struct kvcache_dict *dict,
 		lua_pushnil(L);
 	}
 	return 1;
-}
-
-/*************************** typed value setters *****************************/
-
-int kvcache_set_bool(struct kvcache_dict *dict, struct lua_lsm_module *module,
-		     const char *key, size_t key_len, bool value)
-{
-	struct kvcache_node ntmp = { .tt = LUA_TBOOLEAN, .b = value };
-	int err;
-
-	err = kvcache_core_set(dict, module, key, key_len, &ntmp);
-	kvcache_node_clear(&ntmp);
-	return err;
-}
-
-int kvcache_set_number(struct kvcache_dict *dict, struct lua_lsm_module *module,
-		       const char *key, size_t key_len, long long value)
-{
-	struct kvcache_node ntmp = { .tt = LUA_TNUMBER, .n = value };
-	int err;
-
-	err = kvcache_core_set(dict, module, key, key_len, &ntmp);
-	kvcache_node_clear(&ntmp);
-	return err;
-}
-
-int kvcache_set_string(struct kvcache_dict *dict, struct lua_lsm_module *module,
-		       const char *key, size_t key_len,
-		       const char *value, size_t value_len)
-{
-	struct kvcache_node ntmp;
-	int err;
-
-	ntmp.s = kvcache_string_alloc(value, value_len);
-	if (!ntmp.s)
-		return -ENOMEM;
-	ntmp.tt = LUA_TSTRING;
-
-	err = kvcache_core_set(dict, module, key, key_len, &ntmp);
-	kvcache_node_clear(&ntmp);
-	return err;
-}
-
-/********************************* snapshot **********************************/
-
-static int kvcache_snapshot_fill(struct kvcache_node *node,
-				 struct kvcache_snapshot *snap)
-{
-	unsigned long flags;
-
-	read_lock_irqsave(&node->lock, flags);
-	switch (node->tt) {
-	case LUA_TBOOLEAN:
-		snap->tt = LUA_TBOOLEAN;
-		snap->b = node->b;
-		break;
-	case LUA_TNUMBER:
-		snap->tt = LUA_TNUMBER;
-		snap->n = node->n;
-		break;
-	case LUA_TSTRING:
-		snap->tt = LUA_TSTRING;
-		snap->s = node->s;
-		/* keep the old string alive for concurrent readers */
-		kvcache_string_hold(snap->s);
-		break;
-	case LUA_TLIGHTUSERDATA:
-		/* never export kernel pointers to userspace */
-		read_unlock_irqrestore(&node->lock, flags);
-		return -EOPNOTSUPP;
-	default:
-		WARN_ON(1);
-		read_unlock_irqrestore(&node->lock, flags);
-		return -EINVAL;
-	}
-	read_unlock_irqrestore(&node->lock, flags);
-	return 0;
-}
-
-int kvcache_get_snapshot(struct kvcache_dict *dict,
-			 struct lua_lsm_module *module, const char *key,
-			 struct kvcache_snapshot *snap)
-{
-	struct kvcache_node *node;
-	int err;
-
-	node = kvcache_lookup(dict, module, key);
-	if (!node)
-		return -ENOENT;
-
-	err = kvcache_snapshot_fill(node, snap);
-	kvcache_node_drop(node);
-	return err;
-}
-
-void kvcache_snapshot_put(struct kvcache_snapshot *snap)
-{
-	if (snap->tt == LUA_TSTRING)
-		kvcache_string_drop(snap->s);
-	snap->tt = LUA_TNIL;
 }
 
 static int kvcache_incr(lua_State *L, struct kvcache_dict *dict,
@@ -737,6 +608,151 @@ void kvcache_dict_init(struct kvcache_dict *dict)
 	atomic_set(&dict->state, KVCACHE_DICT_INITING);
 	__kvcache_dict_init(dict);
 	atomic_set_release(&dict->state, KVCACHE_DICT_READY);
+}
+
+static int kvcache_dump_append(char *buf, size_t size, size_t *pos,
+			       const char *value, size_t len)
+{
+	size_t i;
+
+	for (i = 0; i < len; i++) {
+		unsigned char c = value[i];
+
+		if (c >= 0x20 && c < 0x7f && c != '\\') {
+			if (*pos + 1 >= size)
+				return -E2BIG;
+			buf[(*pos)++] = c;
+			continue;
+		}
+
+		if (*pos + 4 >= size)
+			return -E2BIG;
+		*pos += scnprintf(buf + *pos, size - *pos, "\\x%02x", c);
+	}
+	return 0;
+}
+
+/*
+ * Append a stable, text-safe snapshot of one shared dictionary.  Node
+ * references are collected under the tree lock so formatting never holds the
+ * dictionary lock.  Individual value locks protect replacement while a line
+ * is copied to the output buffer.
+ */
+int kvcache_dump(struct kvcache_dict *dict, const char *module_name,
+		 const char *dict_name, char *buf, size_t size, size_t *pos)
+{
+	struct kvcache_node **nodes;
+	struct kvcache_node *node;
+	struct kvcache_node value;
+	unsigned long flags;
+	size_t capacity;
+	size_t count = 0;
+	size_t i;
+	int err = 0;
+	int n;
+
+	if (!kvcache_dict_ready(dict) || !atomic_read(&dict->count))
+		return 0;
+
+	capacity = dict->capacity;
+	nodes = kmalloc_array(capacity, sizeof(*nodes), GFP_KERNEL);
+	if (!nodes)
+		return -ENOMEM;
+
+	read_lock_irqsave(&dict->lock, flags);
+	RB_FOREACH(node, kvcache, &dict->root) {
+		if (count == capacity)
+			break;
+		kvcache_node_hold(node);
+		nodes[count++] = node;
+	}
+	read_unlock_irqrestore(&dict->lock, flags);
+
+	for (i = 0; i < count; i++) {
+		node = nodes[i];
+		err = kvcache_dump_append(buf, size, pos, module_name,
+					  strlen(module_name));
+		if (err)
+			goto out;
+		if (*pos + 1 >= size) {
+			err = -E2BIG;
+			goto out;
+		}
+		buf[(*pos)++] = ' ';
+		err = kvcache_dump_append(buf, size, pos, dict_name,
+					  strlen(dict_name));
+		if (err)
+			goto out;
+		if (*pos + 1 >= size) {
+			err = -E2BIG;
+			goto out;
+		}
+		buf[(*pos)++] = ' ';
+		err = kvcache_dump_append(buf, size, pos, node->key,
+					  strlen(node->key));
+		if (err)
+			goto out;
+
+		value.tt = LUA_TNIL;
+		read_lock_irqsave(&node->lock, flags);
+		kvcache_node_copy(&value, node);
+		read_unlock_irqrestore(&node->lock, flags);
+
+		switch (value.tt) {
+		case LUA_TBOOLEAN:
+			n = snprintf(buf + *pos, size - *pos, " boolean %s\n",
+				     value.b ? "true" : "false");
+			break;
+		case LUA_TNUMBER:
+			n = snprintf(buf + *pos, size - *pos, " number %lld\n",
+				     (long long)value.n);
+			break;
+		case LUA_TSTRING:
+			n = snprintf(buf + *pos, size - *pos, " string ");
+			if (n < 0 || n >= size - *pos) {
+				err = -E2BIG;
+				break;
+			}
+			*pos += n;
+			err = kvcache_dump_append(buf, size, pos, value.s->data,
+						  value.s->len);
+			if (!err) {
+				if (*pos + 1 >= size)
+					err = -E2BIG;
+				else
+					buf[(*pos)++] = '\n';
+			}
+			n = 0;
+			break;
+		case LUA_TLIGHTUSERDATA:
+			n = snprintf(buf + *pos, size - *pos,
+				     " lightuserdata <hidden>\n");
+			break;
+		default:
+			n = -EINVAL;
+			break;
+		}
+		if (value.tt == LUA_TSTRING)
+			kvcache_string_drop(value.s);
+
+		if (err)
+			goto out;
+		if (n < 0) {
+			err = n;
+			goto out;
+		}
+		if (n >= size - *pos) {
+			err = -E2BIG;
+			goto out;
+		}
+		*pos += n;
+	}
+
+out:
+	for (i = 0; i < count; i++)
+		kvcache_node_drop(nodes[i]);
+	kfree(nodes);
+	return err;
 }
 
 /******************************** object cache *******************************/

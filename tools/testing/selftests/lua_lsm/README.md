@@ -1,99 +1,99 @@
-# Lua-LSM securityfs shared dict get/set PoC
+# Lua-LSM shared-dictionary text interface PoC
 
-PoC deliverables for "任务 2": prove the full loop
+This PoC exposes the existing Lua shared-dictionary API through
+`/sys/kernel/security/lua/shdict`. It does not define a second typed kvcache
+API or require a dedicated userspace client.
 
+The end-to-end path is:
+
+```text
+userspace text command -> securityfs parser -> Lua call bridge ->
+shared.<dict>:set/get/incr -> kvcache -> Lua LSM hook
 ```
-load Lua policy -> hook dispatch creates the shared dict ->
-userspace writes/reads it via securityfs -> the Lua hook reads the new
-value immediately and the access decision changes
+
+## Request format
+
+Each write contains one line-oriented request of at most 4096 bytes:
+
+```text
+set <module> <dict> <key> <boolean|number|string|hex> <value>
+get <module> <dict> <key>
+delete <module> <dict> <key>
+incr <module> <dict> <key> [delta]
 ```
 
-All of it is exercised by `shdict_poc.sh` + `shdict_poc.lua` against the
-PoC control file `/sys/kernel/security/lua/shdict` (mode 0600, marked
-**unstable** — not a formal ABI).
+For normal administration, change to the Lua-LSM securityfs directory and
+write readable commands directly:
+
+```sh
+cd /sys/kernel/security/lua
+echo 'set demo runtime blocked_path string /tmp/blocked' > shdict
+cat shdict
+grep '^demo runtime blocked_path ' shdict
+echo 'delete demo runtime blocked_path' > shdict
+```
+
+A fresh read enumerates every key in every named dictionary belonging to a
+LIVE module. Each line has this format:
+
+```text
+<module> <dict> <key> <type> <escaped-value>
+```
+
+Strings use readable text directly. Backslashes and non-printable bytes are
+escaped as `\xNN` in enumeration output. The `hex` input type is available for
+binary-safe strings such as an embedded NUL:
+
+```sh
+echo 'set demo runtime binary_key hex 610062' > shdict
+```
+
+Programs that need one exact result can keep the file descriptor open and
+read the result of `set`, `get`, `delete`, or `incr` from that same open file.
+This keeps request results per-open instead of exposing a racy global
+"last-result" slot.
+
+The file mode is `0600`; open and every read/write also require
+`CAP_MAC_ADMIN`. The parser never evaluates userspace-provided Lua source.
+The bridge constructs a restricted module environment internally and invokes
+the existing shared-dictionary methods by using the Lua C API.
 
 ## Reproduction
 
 ```sh
-# in the linux-dev VM
 make -C /home/maomao-wang/work/lua-lsm/kernel \
   O=/home/maomao-wang/work/lua-lsm/out-riscv \
   ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- -j4 Image
 
-# copy shdict_poc.{lua,sh} and run-all.sh into rootfs/initramfs-root/tests/,
-# then repack the initramfs:
-(cd rootfs/initramfs-root && find . | cpio -o -H newc | gzip > ../rootfs.cpio.gz)
-
-# boot (init runs the selftests and powers off)
 /home/maomao-wang/work/lua-lsm/scripts/run-qemu.sh
 ```
 
-The test registers `shdict_poc.lua` as module `demo`, triggers one real
-`file_open` dispatch to create the `runtime` dict, then drives every
-command over a single fd. It checks, in order:
+`shdict_poc.sh` verifies:
 
-1. bool / number / plain string / NUL-containing string round-trips
-2. same-key overwrite is visible in the next `get`
-3. `blocked_path=/tmp/blocked` denies that path only
-4. re-setting `blocked_path` changes hook behavior without a module reload
-5. unknown module / dict / key -> `-ENOENT` (both get and set)
-6. unknown type, odd-length and non-hex strings, over-limit names and
-   values -> `-EINVAL` / `-E2BIG`
-7. unprivileged open denied; a root-opened fd must still reject writes
-   after dropping to uid 1000 (per-op `CAP_MAC_ADMIN` -> `-EPERM`)
-7c. a securityfs-written `"a\0b"` value is compared inside the Lua hook
-    against the literal string and stays binary-exact (embedded NULs)
-7d. a lightuserdata value stored by the hook (harvested from the module
-    env with `getfenv(1)` + `pairs()`) is refused with `-EOPNOTSUPP` and
-    never exported to userspace
-7e. a Lua-side string whose hex response would overflow the reply buffer
-    is refused with `-E2BIG` (no silent truncation)
-7f. `shared.runtime.key = nil` from Lua recycles the node: the key is
-    gone (`-ENOENT`) and `kvcache.nusage` returns to its baseline (needs
-    `CONFIG_SECURITY_LUA_LSM_STATS`; skipped otherwise)
-8. a module pinned in a busy task makes `unregister` fail `-EBUSY`; the
-   leftover ZOMBIE module answers `-ESHUTDOWN` (get and set) and the
-   freed dict is never dereferenced
-9. the boot log must show no traceback / BUG / WARNING / refcount KASSERT
+1. boolean, number, string, embedded-NUL, overwrite, delete, and `incr`
+2. dictionary creation on first `shared.<name>` access
+3. enumeration across named dictionaries with safe value escaping
+4. live updates to `blocked_path` changing a real `file_open` decision
+5. malformed commands, unknown modules, unsupported types, and input limits
+6. open-time and per-operation `CAP_MAC_ADMIN` enforcement
+7. repeated requests without Lua stack contamination
+8. rejection of requests after the target module leaves LIVE state
 
-## Command / response summary
+The boot log must contain no unexpected Lua traceback, BUG, WARNING, or
+reference-count assertion.
 
-```
-set <module> <dict> <key> bool <0|1>
-set <module> <dict> <key> number <signed decimal>
-set <module> <dict> <key> string <hex bytes>
-get <module> <dict> <key>
-      -> OK | bool <0|1> | number <dec> | string <lowercase hex> | ERR -<errno>
-```
+`shdict_stress.sh` additionally runs two writers and two enumeration/hook
+readers in parallel, verifies the final atomic counter, and unregisters the
+module after all workers exit.
 
-limits: input <= 4096 bytes; module/dict/key 1..128 bytes, no
-whitespace/control chars; decoded string <= 1024 bytes.
+## Implementation boundary
 
-## Lifecycle (one page)
-
-- `lua_lsm_module` owns the `shdicts` list (`shdict_lock` +
-  `shdict_count`); each `lua_lsm_module_shdict` embeds a `kvcache_dict`
-  (rbtree of `kvcache_node`s guarded by the dict's rwlock; per-node
-  rwlock + refcount for values and concurrent readers).
-- A dict is created **only** by Lua code touching `shared.<name>`
-  (`lua_shared_index`), never by securityfs.
-- Module states: `COMING -> LIVE -> GOING -> ZOMBIE | freed`.
-  `lua_lsm_module_unregister()` moves a module out of LIVE, frees its
-  shdicts and GCs its kvnodes all under `modules_mutex`; if some task
-  still holds the module it stays listed as ZOMBIE with freed dicts.
-- PoC safety boundary (deliberately narrower than upstream PR #16, which
-  adds tombstoned refcounted shdict userdata for the Lua side — not
-  cherry-picked here): every securityfs lookup (module, then dict under
-  `shdict_lock`) and the whole get/set runs with `modules_mutex` held;
-  only `LMS_STATE_LIVE` modules are dereferenced. Non-LIVE -> `-ESHUTDOWN`
-  before the dict pointer is ever used; unknown module/dict/key -> `-ENOENT`.
-- String values are kernel-copied, immutable, refcounted payloads; nodes
-  only exchange references, readers hold a reference for the duration of
-  a snapshot, and the old value is recycled when the last holder drops it
-  (refcount balance holds across insert/overwrite/read/delete/dict free;
-  the debug build's refcount KASSERTs catch leaks).
-- Known limits: no dict enumeration or delete commands; no per-module
-  directories; no `-EBUSY`-then-hook regression test (upstream PR #16's
-  territory); same-fd concurrent writers are undefined; empty string
-  values are not expressible (token grammar); not stress-tested under
-  KASAN/KCSAN.
+- The string extension remains inside the original kvcache Lua path. String
+  payloads are copied, length-aware, immutable, and reference-counted.
+- securityfs parses only the public text grammar. It does not directly insert,
+  overwrite, or remove kvcache nodes.
+- The bridge pushes structured arguments onto the Lua stack and calls the
+  original `shared` methods; it does not compile user-supplied Lua code.
+- The target module and its dictionaries remain protected for the complete
+  call. Every exit path restores the Lua stack and releases all resources.
+- The interface remains a development PoC, not a stable userspace ABI.
