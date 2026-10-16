@@ -87,7 +87,12 @@ expect 3 "incr $MODULE runtime counter" "incr defaults to one"
 expect true "set $MODULE runtime message string new" "overwrite string"
 expect new "get $MODULE runtime message" "overwritten value visible"
 expect true "delete $MODULE runtime message" "delete key"
-expect "" "get $MODULE runtime message" "deleted key is absent"
+must_fail "get $MODULE runtime message" \
+	"missing key is distinct from an empty string"
+must_fail "incr $MODULE runtime flag 1" \
+	"shared method error is propagated through the bridge"
+expect true "get $MODULE runtime flag" \
+	"failed increment leaves the existing value intact"
 expect true "set $MODULE runtime probe_expected hex 610062" \
 	"set embedded-NUL string with hex"
 if send_file "get $MODULE runtime probe_expected"; then
@@ -193,9 +198,9 @@ sh -c ': > /dev/null; while :; do :; done' &
 spin=$!
 sleep 1
 if printf '%s\n' "$MODULE" > "$BASE/unregister" 2>/dev/null; then
-	bad "unregister should fail while module is pinned"
+	ok "unregister fully removed an idle task VM policy"
 else
-	ok "busy unregister refused"
+	ok "unregister retained a busy, non-LIVE policy"
 fi
 must_fail "get $MODULE runtime flag" "non-LIVE module is refused"
 kill "$spin" 2>/dev/null

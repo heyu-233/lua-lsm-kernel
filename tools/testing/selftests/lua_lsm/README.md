@@ -1,5 +1,38 @@
 # Lua-LSM shared-dictionary text interface PoC
 
+## RISC-V setjmp/longjmp and Lua error recovery
+
+Task 1 has two complementary tests:
+
+- `arch/riscv/kernel/tests/setjmp_kunit.c` directly checks that `setjmp()` initially
+  returns zero, `longjmp(label, 0)` returns one, nonzero values are preserved,
+  and control is restored through several nested call frames.
+- `setjmp_recovery.sh` submits intentional Lua syntax and registration-time
+  runtime errors, then registers a valid `file_open` policy. The policy raises
+  another runtime error from its hook before the same task invokes the hook
+  again, verifying that protected error paths leave both the VM and kernel
+  usable. A denied open in that same task confirms that recovery still
+  executes policy, rather than merely allowing access through error fallback.
+
+Enable the RISC-V KUnit suite before building the QEMU kernel:
+
+```sh
+scripts/config --file ../out-riscv/.config \
+  --enable KUNIT \
+  --enable RUNTIME_KERNEL_TESTING_MENU \
+  --enable RISCV_SETJMP_KUNIT_TEST
+make O=../out-riscv ARCH=riscv olddefconfig
+make O=../out-riscv ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- -j4 Image
+```
+
+After booting the resulting kernel and mounting `proc`, `sysfs`, and
+`securityfs`, run both the boot-time KUnit check and the Lua recovery flow
+with one command:
+
+```sh
+sh /tests/setjmp_recovery.sh /tests
+```
+
 This PoC exposes the existing Lua shared-dictionary API through
 `/sys/kernel/security/lua/shdict`. It does not define a second typed kvcache
 API or require a dedicated userspace client.
@@ -53,6 +86,23 @@ read the result of `set`, `get`, `delete`, or `incr` from that same open file.
 This keeps request results per-open instead of exposing a racy global
 "last-result" slot.
 
+`dup()` and `fork()` share an open-file description, including its response
+and read cursor. A per-open mutex protects buffer replacement, lazy snapshot
+creation, and cursor movement for each read/write syscall. It is not held
+between syscalls: another writer may replace a response before its original
+requester reads it. Use separate opens for independent clients, or serialize
+the complete write-and-read transaction in userspace. An interrupted lock
+wait is restartable; every operation still checks the calling task's capability.
+The interface uses `stream_open()`: it has no file offsets or seek/pread/pwrite
+protocol. Shared-FD reads and writes can enter concurrently, with the context
+mutex providing protection instead of relying on VFS file-position locking.
+
+`get` on a missing key fails at write time with `ENOENT`. An existing empty
+string is successful and produces a zero-byte response on the same file
+descriptor. Errors returned by the shared method are propagated as errno;
+for example, incrementing a boolean value fails with `EINVAL` and leaves
+the value unchanged.
+
 The file mode is `0600`; open and every read/write also require
 `CAP_MAC_ADMIN`. The parser never evaluates userspace-provided Lua source.
 The bridge constructs a restricted module environment internally and invokes
@@ -86,6 +136,111 @@ reference-count assertion.
 readers in parallel, verifies the final atomic counter, and unregisters the
 module after all workers exit.
 
+## Concurrent unregister test
+
+`shdict_lifecycle.sh` runs a separate fixture named `lifecycle`. Its C test
+workload generator is not a userspace administration client. Build it for
+RV64 before copying the scripts, fixture and binary into the QEMU rootfs:
+
+```sh
+make -C tools/testing/selftests/lua_lsm \
+  CROSS_COMPILE=riscv64-linux-gnu- USERLDFLAGS=-static USERCFLAGS=-Werror
+```
+
+Inside QEMU, with the files installed together under `/tests`:
+
+```sh
+sh /tests/shdict_lifecycle.sh
+# Optional longer run; the default is three complete register/remove cycles.
+LIFECYCLE_ROUNDS=5 sh /tests/shdict_lifecycle.sh
+```
+
+Two writers, one getter, one fresh-snapshot enumerator and one file-open
+worker each use their own file descriptors. Before unregister starts, every
+worker must finish at least 100 operations and the hook must deny its test
+file. Workers remain running throughout unregister; their withdrawal-phase
+attempt counts must be nonzero. This is workload overlap, not a claim that
+every exact kernel instruction interleaving has been forced.
+
+After unregister returns, every worker must finish another 100 checks:
+new dictionary requests fail with `ESHUTDOWN` or `ENOENT`, fresh enumeration
+omits the module, and the removed policy no longer denies the test file.
+The test compares the module listing with the returned errno to distinguish
+a retained non-LIVE module from a removed module. It does not require old
+per-open response buffers or previously prepared snapshots to be erased.
+Both writers now race on one `churn` key, repeatedly replacing embedded-NUL
+and ordinary strings with numbers/booleans and deleting the key. The getter
+accepts only complete known values or a legitimately deleted key; the hook
+checks both a new value and its retained Lua copy from the previous open.
+A saved binary get response and a partially read enumeration snapshot are
+kept open across churn and complete unregister, and must remain readable
+after the module is fully removed. These buffers own copies, not dictionary
+node pointers. Fresh requests must still fail after removal.
+
+`EBUSY` alone is not a pass. It can leave a ZOMBIE module while task VMs
+still hold references. After joining workers, the test retries unregister,
+requires the module to disappear from `modules`, and requires `ENOENT` on
+a subsequent get before registering the fixture again. Unexpected errno,
+worker failure, stalled progress, or new kernel diagnostics fails the test.
+
+The wrapper checks only the new dmesg lines, so intentional tracebacks from
+the separate Lua recovery test do not contaminate this test's result. It
+fails if the log wraps. It does not replace KASAN, leak accounting, or
+comprehensive memory-safety testing.
+
+## Shared open-file description test
+
+Build and install `shdict_shared_fd` with the other selftest helpers, then run:
+
+```sh
+sh /tests/shdict_shared_fd.sh
+```
+
+The private `sharedfd` fixture has two 2048-byte values. Five checks cover
+dup/fork cursor and response sharing, separate-open isolation, 20 fresh
+concurrent lazy snapshots (exact total bytes and byte histograms), two writers
+replacing responses while two readers consume partial chunks, complete
+transactions serialized by a userspace mutex, and EFAULT/invalid-request
+recovery. Four workers use duplicated descriptors referencing the same open.
+No response ownership across a write/read pair is promised without client
+serialization. The test requires actual reader progress, checks the scalar
+chunks for torn data, removes its fixture, and checks new kernel diagnostics.
+Its alarm plus an external QEMU timeout bounds stuck or deadlocked tests.
+
+## Optional performance baseline
+
+`shdict_bench` is an optional C workload generator built by the same command
+as `shdict_lifecycle`; it is not a production administration client and is
+not part of the default functional test run. Run it in a fresh QEMU boot,
+before other tests register policies:
+
+```sh
+/tests/shdict_bench 10000 5 500
+# Arguments: measured requests per group, repetitions, warmups per thread.
+```
+
+It registers four private `perfbench_<id>` policies, creates a `runtime`
+dictionary with four string keys and one counter in each, and removes only
+those policies afterwards. The five workloads are 32/256-byte string
+set/get and numeric incr. Each workload runs with 1/2/4 independent-FD
+threads; 2/4 threads test both one shared module and separate modules.
+The default measures 25 groups five times: 1,250,000 requests in total,
+plus 162,500 warmup requests. Case order rotates between repetitions.
+
+Every result and the final incr counters are checked. CSV includes group
+throughput, mean request latency, P50/P95/P99 and maximum latency. Request
+latency covers `write()` and all response reads through EOF, not only the
+Lua bridge. FD open, initialization, warmup, thread creation, sorting and
+cleanup are excluded. Per-response validation and loop/clock overhead are
+included in group throughput; validation is outside request latency.
+Clock-pair overhead is reported separately and is not subtracted.
+
+Fix the kernel/config, QEMU version, TCG mode, vCPU/RAM and host load when
+comparing versions. QEMU results are relative baselines, not real-board
+performance or measurements of the bridge in isolation. This benchmark
+does not measure enumeration, hook throughput, unregister races or shared-FD
+concurrency; use the separate functional/lifecycle tests for those cases.
+
 ## Implementation boundary
 
 - The string extension remains inside the original kvcache Lua path. String
@@ -94,6 +249,129 @@ module after all workers exit.
   overwrite, or remove kvcache nodes.
 - The bridge pushes structured arguments onto the Lua stack and calls the
   original `shared` methods; it does not compile user-supplied Lua code.
-- The target module and its dictionaries remain protected for the complete
-  call. Every exit path restores the Lua stack and releases all resources.
+- The target module and its dictionaries remain protected by `modules_ss`
+  SRCU for the complete call. The VM is acquired before entering SRCU. A
+  request admitted while LIVE may finish after LIVE -> GOING; unregister
+  waits for the reader before freeing dictionaries. Neither the bridge nor
+  enumeration acquires `modules_mutex` inside the read-side section.
+  Registration/unregistration remain serialized by that mutex.
+- A `lua_cpcall()` boundary includes environment construction, argument
+  preparation, method invocation and response conversion. String get uses a
+  protected conversion and drops C snapshot references before reporting OOM.
+  Initial VM closure construction is protected as well. Errors cannot skip
+  the outer C cleanup of the stack, SRCU and VM reference.
+- The per-open mutex protects only that open's response. Tree/node rwlocks
+  and string/node references still protect data shared by independent opens
+  and hooks. Removing a key checks membership under the tree write lock so
+  simultaneous deleters cannot remove/drop the tree reference twice.
+- Module removal from an idle task VM reuses an existing registry-table key;
+  it does not allocate or collect Lua garbage under `task_call_func()` raw
+  scheduler locks. Normal VM collection/destruction reclaims unreachable
+  module tables later. RISC-V longjmp unpoisons abandoned stack frames when
+  KASAN stack instrumentation is enabled.
 - The interface remains a development PoC, not a stable userspace ABI.
+
+## Permission and consistency decisions
+
+The intended operator is a host administrator. Both reading and writing
+require `CAP_MAC_ADMIN` in `init_user_ns`, in addition to DAC permission for
+the root-owned mode-0600 file. Reads are privileged because policy data may
+be sensitive. Capability checks occur at open and each operation, so a
+passed/inherited FD does not grant the recipient authority. User-namespace
+root is not host administration. Per-module delegation and unprivileged
+read access are deliberately not implemented. This uses the project's
+existing capability helper, including its kernel-thread treatment.
+
+The maximum write is 4096 bytes including framing/newline. Scalar results
+have a 4096-byte limit; enumeration has a 64-KiB buffer and returns E2BIG
+instead of a successful partial snapshot. Empty dictionaries do not add
+placeholder lines; `modules` is the separate module-listing interface.
+Enumeration gathers references and copies each value safely, but concurrent
+hooks may change different keys between copies: it is not a global
+point-in-time transaction. lightuserdata addresses remain hidden.
+
+An error does not guarantee rollback. A dictionary update can have committed
+before response conversion fails. Requests entering parsing replace the
+per-open response; early capability/length rejection does not promise to
+erase the previous response. Never infer write success from a later read
+without checking the write's return value. Zero-length reads perform no
+snapshot allocation and do not move the cursor, but still check capability.
+
+## Final validation profiles
+
+The additional C programs are test workload generators, not administration
+clients. `shdict_boundary.sh` covers DAC/capability separation, inherited-FD
+read and write checks, user namespace root, exact length boundaries,
+concurrent first creation/atomic increments, same-key set/delete and
+enumeration overflow/recovery.
+
+`shdict_fault` is opt-in and **must only run in a disposable QEMU guest**.
+It arms `/proc/self/fail-nth` around one target operation at a time, records
+whether a failure was actually consumed, disables injection and verifies
+recovery in the same task/FD. Cold VM setup, string set/get, lazy enumeration
+and open allocation are swept until the first allocation beyond the request,
+with a hard limit of 4096 points. Failed allocation can be internally
+recovered, so injected requests need not all return ENOMEM. Lack of the
+required controls, zero injected failures or reaching the cap is failure,
+not PASS. `lua.lvm_pool_max=0` is required for cold-VM testing.
+
+Use `config.debug` on top of the saved normal config for Generic KASAN,
+lockdep, atomic-sleep diagnostics, task-scoped allocation faults and kprobe
+trace events. Use `config.kmemleak` separately for leak checking; tracking
+metadata must not contaminate the allocation-fault sweep or performance.
+`shdict_kmemleak.sh` records before/after reports and requires an empty final
+report after fixture cleanup and two scans. Disable VM pooling for this run.
+
+`shdict_manage_bench` separately measures enumeration and mixed workloads
+(enum/get/set/incr), with independent FDs at 1/2/4 threads. Fresh enum includes
+open and close; mixed responses and final counters are checked. Default is
+1000 operations per thread, five repetitions. These CSV records are separate
+from `shdict_bench` scalar latency. `shdict_trace.sh` uses kprobe/kretprobe
+events in tracefs for entry/exit timestamps; tracing is disabled during all
+performance comparisons. This works without GCC function-graph support.
+
+### Reproduce without changing the demo image
+
+Run the following on the Linux development machine. Set `kernel`, `run`,
+`base_root`, and `config` to absolute paths; `base_root` is an existing
+BusyBox initramfs tree, not its compressed archive. Save the source commit
+and actual merged config with the results.
+
+```sh
+kernel=/home/maomao-wang/work/lua-lsm/kernel
+run=$(mktemp -d /home/maomao-wang/work/lua-lsm/verify-final.XXXXXX)
+# Supply the saved normal config and an existing BusyBox rootfs tree:
+config=/absolute/path/to/config-normal
+base_root=/absolute/path/to/busybox-root
+mkdir "$run/out"
+cp "$config" "$run/out/.config"
+make -C "$kernel" O="$run/out" ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- olddefconfig
+make -C "$kernel" O="$run/out" ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- -j4 Image
+sudo cp -a "$base_root" "$run/root"
+make -C "$kernel/tools/testing/selftests/lua_lsm" CROSS_COMPILE=riscv64-linux-gnu- \
+  USERLDFLAGS=-static USERCFLAGS=-Werror install INSTALL_PATH="$run/root/tests"
+cp "$kernel/tools/testing/selftests/lua_lsm/qemu_init.sh" "$run/root/init"
+chmod +x "$run/root/init"
+(cd "$run/root" && sudo find . -print0 | sudo cpio --null -o --format=newc) \
+  | gzip -9 > "$run/rootfs.cpio.gz"
+sh "$kernel/tools/testing/selftests/lua_lsm/run_qemu.sh" \
+  "$run/out/arch/riscv/boot/Image" "$run/rootfs.cpio.gz" "$run/full.log" full 2 20
+```
+
+For a debug or leak build, use a different output directory and merge the
+corresponding fragment before `olddefconfig`:
+
+```sh
+ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- \
+  "$kernel/scripts/kconfig/merge_config.sh" -m -O "$run/out" \
+  "$config" "$kernel/tools/testing/selftests/lua_lsm/config.debug"
+```
+
+Then build normally and run with `QEMU_MEMORY=2G`; modes are `full` (debug
+rounds 10), `fault`, `kmemleak`, or `trace`. The host runner checks both QEMU
+status and the guest success marker and rejects unexpected kernel
+diagnostics. Missing features and timeouts are not success. Keep intentional
+Lua-error tests separate from assertions about unexpected Lua tracebacks.
+Performance mode is `perf`, uses the normal kernel, and runs both benchmark
+programs; do three A/B pairs in A-B, B-A, A-B order with identical config and
+test binaries. Keep all raw logs, CSV, configuration and image checksums.
