@@ -10,6 +10,8 @@
 #include "debug.h"
 #include <linux/init.h>
 #include <linux/bitops.h>
+#include <linux/err.h>
+#include <linux/errname.h>
 #include <linux/kstrtox.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -749,49 +751,49 @@ static int module_load(lua_State *L, struct lua_lsm_module *module)
 	return 0;
 }
 
-int lua_lsm_shdict_call(const struct lua_lsm_shdict_request *request,
-			char *result, size_t result_size,
-			size_t *result_len)
+static int lua_lsm_errno_from_errname(const char *name)
 {
+	int nr;
+
+	if (!name)
+		return -EIO;
+
+	/* kvcache_result() reports the canonical string produced by errname(). */
+	for (nr = 1; nr <= MAX_ERRNO; nr++) {
+		const char *candidate = errname(-nr);
+
+		if (candidate && !strcmp(candidate, name))
+			return -nr;
+	}
+
+	return -EIO;
+}
+
+struct shdict_call_ctx {
+	const struct lua_lsm_shdict_request *request;
 	struct lua_lsm_module *module;
-	lua_State *L;
+	char *result;
+	size_t result_size;
+	size_t result_len;
+	int err;
+};
+
+/* Every allocating Lua operation, including setup, runs under lua_cpcall. */
+static int shdict_call_protected(lua_State *L)
+{
+	struct shdict_call_ctx *ctx = lua_touserdata(L, 1);
+	const struct lua_lsm_shdict_request *request = ctx->request;
 	const char *method;
 	const char *value;
 	size_t value_len;
 	int nargs;
-	int top;
-	int found = 0;
-	int err = -ENOENT;
-
-	*result_len = 0;
-	L = lvm_get();
-	if (!L)
-		return -ENOMEM;
-	top = lua_gettop(L);
-
-	/*
-	 * Keep the module and its dictionaries alive for the whole Lua call.
-	 * lvm_get() deliberately precedes modules_mutex to preserve lock order.
-	 */
-	mutex_lock(&modules_mutex);
-	list_for_each_entry(module, &lsm_modules, list) {
-		if (strcmp(module->name, request->module) == 0) {
-			found = 1;
-			break;
-		}
-	}
-	if (!found)
-		goto out;
-	if (module->state != LMS_STATE_LIVE) {
-		err = -ESHUTDOWN;
-		goto out;
-	}
+	int err;
 
 	/* Resolve shared.<dict> in the same restricted module environment used by
 	 * the previous PoC, but invoke the existing method directly instead of
 	 * compiling user-provided Lua source.
 	 */
-	module_env_push(L, module, true);
+	module_env_push(L, ctx->module, true);
 	lua_getfield(L, -1, "shared");
 	lua_pushstring(L, request->dict);
 	lua_gettable(L, -2);
@@ -849,28 +851,38 @@ int lua_lsm_shdict_call(const struct lua_lsm_shdict_request *request,
 		}
 	}
 
-	err = lua_pcall_wrap(L, nargs, 1, 0);
-	if (err)
+	/*
+	 * Shared methods return either one value or (nil, errname). Request two
+	 * results so the bridge does not discard the error reported by kvcache.
+	 */
+	lua_call(L, nargs, 2);
+	if (!lua_isnil(L, -1)) {
+		if (!lua_isstring(L, -1)) {
+			err = -EIO;
+			goto out;
+		}
+		err = lua_lsm_errno_from_errname(lua_tostring(L, -1));
 		goto out;
+	}
 
-	switch (lua_type(L, -1)) {
+	switch (lua_type(L, -2)) {
 	case LUA_TNIL:
-		err = request->op == LUA_LSM_SHDICT_GET ? 0 : -EINVAL;
+		err = request->op == LUA_LSM_SHDICT_GET ? -ENOENT : -EIO;
 		break;
 	case LUA_TBOOLEAN:
-		value = lua_toboolean(L, -1) ? "true" : "false";
+		value = lua_toboolean(L, -2) ? "true" : "false";
 		value_len = strlen(value);
 		goto copy_result;
 	case LUA_TNUMBER:
 	case LUA_TSTRING:
-		value = lua_tolstring(L, -1, &value_len);
+		value = lua_tolstring(L, -2, &value_len);
 copy_result:
-		if (value_len > result_size) {
+		if (value_len > ctx->result_size) {
 			err = -E2BIG;
 			break;
 		}
-		memcpy(result, value, value_len);
-		*result_len = value_len;
+		memcpy(ctx->result, value, value_len);
+		ctx->result_len = value_len;
 		err = 0;
 		break;
 	default:
@@ -879,10 +891,71 @@ copy_result:
 	}
 
 out:
+	ctx->err = err;
+	return 0;
+}
+
+int lua_lsm_shdict_call(const struct lua_lsm_shdict_request *request,
+			char *result, size_t result_size,
+			size_t *result_len)
+{
+	struct shdict_call_ctx ctx = {
+		.request = request,
+		.result = result,
+		.result_size = result_size,
+		.err = -EIO,
+	};
+	struct lua_lsm_module *module;
+	lua_State *L;
+	int top, status, idx;
+
+	*result_len = 0;
+	L = lvm_get();
+	if (!L)
+		return -ENOMEM;
+	top = lua_gettop(L);
+	/* Never acquire modules_mutex inside this SRCU section: unregister
+	 * holds that mutex while waiting for these readers to finish.
+	 */
+	idx = srcu_read_lock(&modules_ss);
+	list_for_each_entry_srcu(module, &lsm_modules, list,
+				 srcu_read_lock_held(&modules_ss)) {
+		if (!strcmp(module->name, request->module)) {
+			ctx.module = module;
+			break;
+		}
+	}
+	if (!ctx.module) {
+		ctx.err = -ENOENT;
+		goto out;
+	}
+	if (READ_ONCE(ctx.module->state) != LMS_STATE_LIVE) {
+		ctx.err = -ESHUTDOWN;
+		goto out;
+	}
+	status = lua_cpcall(L, shdict_call_protected, &ctx);
+	if (status) {
+		switch (status) {
+		case LUA_ERRMEM:
+			ctx.err = -ENOMEM;
+			break;
+		case LUA_ERRRUN:
+			ctx.err = -ENOEXEC;
+			break;
+		case LUA_ERRERR:
+			ctx.err = -EFAULT;
+			break;
+		default:
+			ctx.err = -EINVAL;
+		}
+	}
+out:
 	lua_settop(L, top);
-	mutex_unlock(&modules_mutex);
+	srcu_read_unlock(&modules_ss, idx);
 	lvm_put(L);
-	return err;
+	if (!ctx.err)
+		*result_len = ctx.result_len;
+	return ctx.err;
 }
 
 int lua_lsm_shdict_dump(char *buf, size_t size, size_t *result_len)
@@ -894,11 +967,13 @@ int lua_lsm_shdict_dump(char *buf, size_t size, size_t *result_len)
 	size_t count;
 	size_t i;
 	int err = 0;
+	int idx;
 
 	*result_len = 0;
-	mutex_lock(&modules_mutex);
-	list_for_each_entry(module, &lsm_modules, list) {
-		if (module->state != LMS_STATE_LIVE)
+	idx = srcu_read_lock(&modules_ss);
+	list_for_each_entry_srcu(module, &lsm_modules, list,
+				 srcu_read_lock_held(&modules_ss)) {
+		if (READ_ONCE(module->state) != LMS_STATE_LIVE)
 			continue;
 
 		count = atomic_read(&module->shdict_count);
@@ -930,7 +1005,7 @@ int lua_lsm_shdict_dump(char *buf, size_t size, size_t *result_len)
 		if (err)
 			break;
 	}
-	mutex_unlock(&modules_mutex);
+	srcu_read_unlock(&modules_ss, idx);
 	return err;
 }
 
@@ -1099,21 +1174,15 @@ static lua_State *lvm_build_lua_state(struct lvm_state *lvm)
 	lua_atpanic(L, lvm_panic);
 	lua_gc(L, LUA_GCSTOP, 0);
 
-	lua_pushcfunction(L, lvm_pmain);
-	status = lua_pcall(L, 0, 1, 0);
+	/* lua_cpcall also protects allocation of the initial C closure. */
+	status = lua_cpcall(L, lvm_pmain, NULL);
 	if (status != 0) {
 		__log_err("pcall: status = %d, top = %d, %s\n",
 			  status, lua_gettop(L), lua_tostring(L, -1));
 		lua_close(L);
 		return NULL;
 	}
-	if (!lua_toboolean(L, -1) && lua_gettop(L) != 1) {
-		__log_err("lvm_pmain: top = %d, stack[top] = [%s]\n",
-			  lua_gettop(L), luaL_typename(L, -1));
-		lua_close(L);
-		return NULL;
-	}
-	lua_pop(L, 1);
+	lua_settop(L, 0);
 
 	lvm_stats_vmalloc();
 	return L;
@@ -1199,7 +1268,7 @@ int lua_lsm_module_register(const char *code, size_t len)
 	if (!module)
 		goto err_free_lua;
 
-	module->state = LMS_STATE_COMING;
+	WRITE_ONCE(module->state, LMS_STATE_COMING);
 	__BITMAP_ZERO(&module->hookfuncs);
 
 	/* traversal the result table */
@@ -1339,7 +1408,7 @@ int lua_lsm_module_register(const char *code, size_t len)
 				atomic_inc(&lua_lsm_hook_stats[i].nhooks);
 		}
 
-		module->state = LMS_STATE_LIVE;
+		WRITE_ONCE(module->state, LMS_STATE_LIVE);
 		list_add_tail_rcu(&module->list, &lsm_modules);
 		/*
 		 * Once any Lua policy has been loaded, inactive free-hook cleanup
@@ -1373,22 +1442,23 @@ err_free_lua:
 static int lvm_remove_module(lua_State *L, struct lua_lsm_module *module)
 {
 	int err = -ENOENT;
-	/* registry._MODULES[modname] = nil */
+	/* Called with task_call_func's raw scheduler locks held. Do not intern a
+	 * new module-name string or run GC here: either can enter the allocator.
+	 * _MODULES is already interned by lvm_pmain. Reuse an existing table key
+	 * and leave collection of unreachable objects to normal VM GC/destruction.
+	 */
 	lua_getfield(L, LUA_REGISTRYINDEX, "_MODULES");
 	if (lua_istable(L, -1)) {
-		lua_pushstring(L, module->name);
-		lua_rawget(L, -2);
-		if (lua_istable(L, -1)) {
-			lua_pop(L, 1);
-
-			lua_pushstring(L, module->name);
-			lua_pushnil(L);
-			lua_rawset(L, -3);
-
-			/* performs a full garbage-collection cycle. */
-			lua_gc(L, LUA_GCCOLLECT, 0);
-			err = 0;
-		} else {
+		lua_pushnil(L);
+		while (lua_next(L, -2)) {
+			if (lua_type(L, -2) == LUA_TSTRING && lua_istable(L, -1) &&
+			    !strcmp(lua_tostring(L, -2), module->name)) {
+				lua_pop(L, 1); /* keep the already-interned key */
+				lua_pushnil(L);
+				lua_rawset(L, -3);
+				err = 0;
+				break;
+			}
 			lua_pop(L, 1);
 		}
 	}
@@ -1501,8 +1571,8 @@ int lua_lsm_module_unregister(const char *name)
 			break;
 		}
 	}
-	if (found && module->state == LMS_STATE_LIVE) {
-		module->state = LMS_STATE_GOING;
+	if (found && READ_ONCE(module->state) == LMS_STATE_LIVE) {
+		WRITE_ONCE(module->state, LMS_STATE_GOING);
 		static_branch_dec(&lua_lsm_modules_active);
 
 		for (i = 0; lua_lsm_hook_stats[i].name; i++) {
@@ -1602,7 +1672,7 @@ int lua_lsm_module_unregister(const char *name)
 		lua_lsm_module_free(module);
 		err = 0;
 	} else {
-		module->state = LMS_STATE_ZOMBIE;
+		WRITE_ONCE(module->state, LMS_STATE_ZOMBIE);
 		err = -EBUSY;
 	}
 	mutex_unlock(&modules_mutex);

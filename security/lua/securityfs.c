@@ -9,6 +9,7 @@
 #include <linux/security.h>
 #include <linux/hex.h>
 #include <linux/vmalloc.h>
+#include <linux/mutex.h>
 #include "lsm.h"
 
 static bool lua_lsm_capable(int cap)
@@ -140,6 +141,8 @@ static const struct file_operations fops_modules = {
 #define SHDICT_NAME_MAX		128
 
 struct shdict_ctx {
+	/* dup()/fork() share this context; serialize each syscall, not a transaction. */
+	struct mutex lock;
 	char *buf;	/* response or enumeration buffer */
 	size_t capacity;
 	size_t len;	/* bytes valid in buf */
@@ -163,9 +166,11 @@ static int shdict_open(struct inode *inode, struct file *filp)
 		return -ENOMEM;
 	}
 	ctx->capacity = SHDICT_IO_MAX;
+	mutex_init(&ctx->lock);
 
 	filp->private_data = ctx;
-	return 0;
+	/* Position belongs to ctx, not file->f_pos; no seek/pread/pwrite protocol. */
+	return stream_open(inode, filp);
 }
 
 static int shdict_release(struct inode *inode, struct file *filp)
@@ -184,35 +189,50 @@ static ssize_t shdict_read(struct file *file, char __user *buf, size_t len,
 {
 	struct shdict_ctx *ctx = file->private_data;
 	size_t n;
+	ssize_t ret;
 	int err;
 
 	if (!lua_lsm_capable(CAP_MAC_ADMIN))
 		return -EPERM;
+	if (!len)
+		return 0;
+	if (mutex_lock_interruptible(&ctx->lock))
+		return -ERESTARTSYS;
 	if (!ctx->prepared) {
 		char *dump_buf;
 
 		dump_buf = kvmalloc(SHDICT_DUMP_MAX, GFP_KERNEL);
-		if (!dump_buf)
-			return -ENOMEM;
+		if (!dump_buf) {
+			ret = -ENOMEM;
+			goto out;
+		}
 		kvfree(ctx->buf);
 		ctx->buf = dump_buf;
 		ctx->capacity = SHDICT_DUMP_MAX;
 		err = lua_lsm_shdict_dump(ctx->buf, ctx->capacity, &ctx->len);
-		if (err)
-			return err;
+		if (err) {
+			ret = err;
+			goto out;
+		}
 		ctx->pos = 0;
 		ctx->prepared = true;
 	}
 	n = ctx->len - ctx->pos;
-	if (n == 0)
-		return 0;
+	if (n == 0) {
+		ret = 0;
+		goto out;
+	}
 	if (n > len)
 		n = len;
-	if (copy_to_user(buf, ctx->buf + ctx->pos, n))
-		return -EFAULT;
+	if (copy_to_user(buf, ctx->buf + ctx->pos, n)) {
+		ret = -EFAULT;
+		goto out;
+	}
 	ctx->pos += n;
-	*ppos += n;
-	return n;
+	ret = n;
+out:
+	mutex_unlock(&ctx->lock);
+	return ret;
 }
 
 static char *shdict_next_token(char **cursor)
@@ -283,6 +303,8 @@ static ssize_t shdict_write(struct file *file, const char __user *buf,
 		return -EINVAL;
 	if (len > SHDICT_IO_MAX)
 		return -E2BIG;
+	if (mutex_lock_interruptible(&ctx->lock))
+		return -ERESTARTSYS;
 
 	/* Every write replaces the response associated with this open file. */
 	ctx->len = 0;
@@ -290,8 +312,11 @@ static ssize_t shdict_write(struct file *file, const char __user *buf,
 	ctx->prepared = true;
 
 	input = memdup_user_nul(buf, len);
-	if (IS_ERR(input))
-		return PTR_ERR(input);
+	if (IS_ERR(input)) {
+		err = PTR_ERR(input);
+		input = NULL;
+		goto out;
+	}
 
 	/* Literal NULs and multi-line commands are not valid text framing. */
 	if (strnlen(input, len) != len) {
@@ -406,6 +431,7 @@ static ssize_t shdict_write(struct file *file, const char __user *buf,
 out:
 	kfree(decoded);
 	kfree(input);
+	mutex_unlock(&ctx->lock);
 	return err ?: len;
 }
 

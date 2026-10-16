@@ -263,7 +263,7 @@ kvcache_module_link(struct kvcache_dict *dict,
 	} else {
 		atomic_inc(&dict->count);
 		if (module) {
-			WARN_ON(module->state != LMS_STATE_LIVE);
+			/* An admitted SRCU reader may finish after LIVE -> GOING. */
 			spin_lock(&module->kvnodes_lock);
 			list_add_tail_rcu(&node->modlist, &module->kvnodes);
 			atomic_inc(&module->kvnodes_count);
@@ -276,11 +276,14 @@ unlock:
 	return prev;
 }
 
-static void
+static bool
 kvcache_module_unlink_unlocked(struct kvcache_dict *dict,
 			       struct lua_lsm_module *module,
 			       struct kvcache_node *node)
 {
+	/* Two deleters may have acquired lookup references to the same node. */
+	if (RB_FIND(kvcache, &dict->root, node) != node)
+		return false;
 	RB_REMOVE(kvcache, &dict->root, node);
 	atomic_dec(&dict->count);
 	if (module) {
@@ -289,18 +292,21 @@ kvcache_module_unlink_unlocked(struct kvcache_dict *dict,
 		atomic_dec(&module->kvnodes_count);
 		spin_unlock(&module->kvnodes_lock);
 	}
+	return true;
 }
 
-static void
+static bool
 kvcache_module_unlink(struct kvcache_dict *dict,
 		      struct lua_lsm_module *module,
 		      struct kvcache_node *node)
 {
 	unsigned long flags;
+	bool removed;
 
 	write_lock_irqsave(&dict->lock, flags);
-	kvcache_module_unlink_unlocked(dict, module, node);
+	removed = kvcache_module_unlink_unlocked(dict, module, node);
 	write_unlock_irqrestore(&dict->lock, flags);
+	return removed;
 }
 
 static int kvcache_node_fill(lua_State *L, int idx, struct kvcache_node *node)
@@ -417,9 +423,9 @@ static int kvcache_set(lua_State *L, struct kvcache_dict *dict,
 		}
 	} else {
 		if (tt == LUA_TNIL) {
-			kvcache_module_unlink(dict, module, node);
+			if (kvcache_module_unlink(dict, module, node))
+				kvcache_node_drop(node); /* tree reference */
 			kvcache_node_drop(node);	/* lookup reference */
-			kvcache_node_drop(node);	/* tree reference */
 		} else {
 			err = kvcache_node_refill(L, 3, node);
 			kvcache_node_drop(node);
@@ -433,34 +439,27 @@ ret:
 	return 1;
 }
 
-static int kvcache_node_get(lua_State *L, struct kvcache_node *node)
+static int kvcache_value_push(lua_State *L)
 {
-	struct kvcache_node ntmp;
-	unsigned long flags;
+	const struct kvcache_node *value = lua_touserdata(L, 1);
 
-	read_lock_irqsave(&node->lock, flags);
-	kvcache_node_copy(&ntmp, node);
-	read_unlock_irqrestore(&node->lock, flags);
-
-	switch (ntmp.tt) {
+	switch (value->tt) {
 	case LUA_TBOOLEAN:
-		lua_pushboolean(L, ntmp.b);
+		lua_pushboolean(L, value->b);
 		break;
 	case LUA_TNUMBER:
-		lua_pushnumber(L, ntmp.n);
+		lua_pushnumber(L, value->n);
 		break;
 	case LUA_TLIGHTUSERDATA:
-		lua_pushlightuserdata(L, ntmp.p);
+		lua_pushlightuserdata(L, value->p);
 		break;
 	case LUA_TSTRING:
-		lua_pushlstring(L, ntmp.s->data, ntmp.s->len);
-		kvcache_string_drop(ntmp.s);
+		lua_pushlstring(L, value->s->data, value->s->len);
 		break;
 	default:
-		WARN_ON(1);
-		return -EINVAL;
+		return luaL_error(L, "invalid dictionary value type");
 	}
-	return 0;
+	return 1;
 }
 
 static int kvcache_get(lua_State *L, struct kvcache_dict *dict,
@@ -468,13 +467,31 @@ static int kvcache_get(lua_State *L, struct kvcache_dict *dict,
 {
 	const char *key = luaL_checkstring(L, 2);
 	struct kvcache_node *node;
+	struct kvcache_node value = { .tt = LUA_TNIL };
+	unsigned long flags;
+	int status;
 
+	/* Closure allocation must precede acquiring any C-owned references. */
+	lua_pushcfunction(L, kvcache_value_push);
+	lua_pushlightuserdata(L, &value);
 	node = kvcache_lookup(dict, module, key);
-	if (node) {
-		kvcache_node_get(L, node);
-		kvcache_node_drop(node);
-	} else {
+	if (!node) {
+		lua_pop(L, 2);
 		lua_pushnil(L);
+		return 1;
+	}
+	read_lock_irqsave(&node->lock, flags);
+	kvcache_node_copy(&value, node);
+	read_unlock_irqrestore(&node->lock, flags);
+	kvcache_node_drop(node);
+
+	/* lua_pushlstring() may longjmp on OOM. Always drop the snapshot first. */
+	status = lua_pcall(L, 1, 1, 0);
+	kvcache_node_clear(&value);
+	if (status) {
+		lua_pop(L, 1);
+		/* lua_error() would turn LUA_ERRMEM into LUA_ERRRUN on rethrow. */
+		return kvcache_result(L, status == LUA_ERRMEM ? -ENOMEM : -EIO);
 	}
 	return 1;
 }
