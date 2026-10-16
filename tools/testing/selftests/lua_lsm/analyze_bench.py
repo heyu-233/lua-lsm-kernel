@@ -18,7 +18,8 @@ def block(text, begin, end):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
-    parser.add_argument("logs", nargs=6, type=Path, metavar="A1 B1 A2 B2 A3 B3")
+    parser.add_argument("logs", nargs=6, type=Path, metavar="LOG",
+                        help="six logs in A1 B1 A2 B2 A3 B3 order")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     groups = {}
