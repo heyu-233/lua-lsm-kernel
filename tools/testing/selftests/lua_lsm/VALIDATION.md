@@ -96,3 +96,71 @@ kmemleak profiles are separate; the empty leak report is not proof for every
 fault/interleaving combination. No KCSAN, exhaustive instruction-level
 schedule exploration, real-board validation or fine-grained authorization
 claim is made. No upstream acceptance or PR merge is implied.
+
+## Consistent enumeration — 2026-10-27
+
+Behavioral source: `b93381247a4177e2f7c6031546a89580aa29123b`.
+Normal, KASAN/lockdep and separate kmemleak images were rebuilt from that
+committed source. This section supersedes the baseline enumeration limit,
+not its remaining shared-FD, authorization, rollback or hardware limits.
+
+Named dictionary changes from both management and Lua hooks, dictionary
+publication, and module LIVE/GOING transitions participate in a generation
+plus overlapping-writer protocol. Readers capture node/string references
+and scalar values, validate the global window, then format immutable copies.
+Only compact tagged values are retained, not entire node/lock structures.
+SRCU still protects module/dictionary lifetime during capture and formatting.
+After eight conflicting attempts read returns EAGAIN without output; partial
+reads of an accepted per-open snapshot are unaffected by later mutations.
+
+| Check | Result |
+| --- | --- |
+| Normal RV64, 1 CPU | full suite, 20 complete unregister/re-register rounds |
+| Normal RV64, 2 CPUs | full suite, 20 rounds |
+| Generic KASAN + lockdep, 2 CPUs | full suite, 10 rounds; no unexpected diagnostics |
+| New snapshot regression | 3/3 in all profiles; partial-read retention, cross-module counters, Lua-hook counters across dictionaries |
+| Allocation failures | all 5 targets recovered; consumed points 1066/15/15/4/5 |
+| Separate kmemleak | empty before/after reports; includes new snapshot test and 10 lifecycle rounds |
+| Build/style | static selftests with -Werror, three kernel configs, git checks passed; kernel patch checkpatch 0 errors/warnings |
+
+The new regression workload also ran against the old `e59a991df` image.
+It detected impossible first/second counter pairs in both the management
+and Lua-hook paths (for example 14/15 and 16/17). The final image passed the
+same test. Debug testing actually returned EAGAIN, checked that the user
+buffer was untouched, and recovered after updates stopped. Fault testing
+now seeds a second named dictionary so later capture-allocation failure
+also exercises cleanup after earlier values have acquired references.
+These are workload tests, not exhaustive instruction-interleaving proofs.
+
+### Enumeration integration performance regression
+
+This is a NEW comparison: A = `e59a991df` with weak enumeration and SRCU;
+B = `b93381247` with consistent snapshots and SRCU. It does not compare
+mutex against SRCU, nor C APIs against Lua. Normal config bytes, toolchain,
+test binaries, rootfs, QEMU parameters and tracing-off settings matched.
+Kernel release/build metadata differs across commits, so this is an
+integration regression check, not an isolated instruction-cost experiment.
+
+Three pairs ran in A1-B1, B2-A2, A3-B3 order with five repetitions per
+scenario: 930 raw rows, 7,500,000 scalar requests and 420,000 separate
+enumeration/mixed operations, all without errors. Medians of the three
+paired throughput changes are:
+
+| Workload | Change |
+| --- | ---: |
+| Scalar scenarios, across 1/2/4 threads | -4.99% to +0.68% |
+| Enumeration, 1 / 2 / 4 threads | +2.63% / -0.88% / -1.35% |
+| Mixed, 1 / 2 / 4 threads | +3.71% / -3.40% / -4.31% |
+
+No scenario declined over 10% in all three pairs. Caller backoff/retries
+were included in latency; raw records and tail latencies were preserved.
+Do not infer universal speedups or real-hardware performance from the small
+positive changes. The purpose is a stronger snapshot contract with measured
+cost, not a claim that consistency is free. Earlier experimental builds
+kept formatting inside the validation window or used oversized records;
+their slower results were retained separately, not mixed into final data.
+
+Logs/images/configs and performance raw.csv/summary.json are retained in the
+local `verify-enum.QsqB32` validation directory. Reproduce via the README's
+private initramfs workflow and the existing host runner. The permission and
+shared-FD transaction contracts have not changed.
