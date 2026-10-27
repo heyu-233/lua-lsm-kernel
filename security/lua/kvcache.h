@@ -59,6 +59,8 @@ struct kvcache_node {
 
 struct kvcache_dict {
 	atomic_t state;
+	/* Set before publishing a named shared dictionary, never for blobs. */
+	bool snapshot_tracked;
 	int capacity;
 	atomic_t count;
 	rwlock_t lock;
@@ -73,8 +75,18 @@ void kvcache_stats_show(struct seq_file *m);
 int kvcache_module_nodes_gc(struct lua_lsm_module *module);
 void kvcache_dict_free(struct kvcache_dict *dict);
 void kvcache_dict_init(struct kvcache_dict *dict);
-int kvcache_dump(struct kvcache_dict *dict, const char *module_name,
-		 const char *dict_name, char *buf, size_t size, size_t *pos);
+int kvcache_dump_capture(struct kvcache_dict *dict, const char *module_name,
+			 const char *dict_name, struct list_head *snapshots,
+			 size_t *remaining);
+int kvcache_dump_format(struct list_head *snapshots, char *buf, size_t size,
+			size_t *pos);
+void kvcache_dump_free(struct list_head *snapshots);
+
+/* Short, non-sleeping mutation windows; never encompass a Lua API call. */
+void shdict_snapshot_write_begin(void);
+void shdict_snapshot_write_end(void);
+bool shdict_snapshot_begin(u64 *generation);
+bool shdict_snapshot_retry(u64 generation);
 
 /******************************** object cache *******************************/
 

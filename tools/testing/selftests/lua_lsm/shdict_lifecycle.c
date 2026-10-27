@@ -89,7 +89,7 @@ static bool contains_module(const char *buf)
 static int snapshot(const char *path, bool *present)
 {
 	char *buf = malloc(BUFFER_SIZE);
-	int fd, ret;
+	int fd, ret, attempt;
 
 	if (!buf)
 		return -ENOMEM;
@@ -98,7 +98,12 @@ static int snapshot(const char *path, bool *present)
 		free(buf);
 		return -errno;
 	}
-	ret = read_all(fd, buf, BUFFER_SIZE);
+	for (attempt = 0; attempt < 200; attempt++) {
+		ret = read_all(fd, buf, BUFFER_SIZE);
+		if (ret != -EAGAIN)
+			break;
+		usleep(1000);
+	}
 	if (ret >= 0) {
 		*present = contains_module(buf);
 		ret = 0;

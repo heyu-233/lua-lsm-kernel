@@ -8,6 +8,7 @@
 #include "debug.h"
 #include <linux/bottom_half.h>
 #include <linux/slab.h>
+#include <linux/vmalloc.h>
 #include <linux/string.h>
 #include <linux/errname.h>
 #include <linux/rwlock.h>
@@ -18,6 +19,60 @@
 #include "auxlib.h"
 #include "lsm.h"
 #include "kvcache.h"
+
+/*
+ * A generation alone misses a writer which has started but not committed.
+ * Count overlapping writers as well. The lock orders both observations and
+ * publication, but is NEVER held across a mutation, allocation or Lua call.
+ * Dictionary/node locks still protect the actual data. Readers may sleep while
+ * capturing values, validate the window, then format only retained copies.
+ */
+static DEFINE_SPINLOCK(shdict_snapshot_lock);
+static u64 shdict_snapshot_generation;
+static unsigned int shdict_snapshot_writers;
+
+void shdict_snapshot_write_begin(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&shdict_snapshot_lock, flags);
+	shdict_snapshot_writers++;
+	spin_unlock_irqrestore(&shdict_snapshot_lock, flags);
+}
+
+void shdict_snapshot_write_end(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&shdict_snapshot_lock, flags);
+	shdict_snapshot_generation++;
+	shdict_snapshot_writers--;
+	spin_unlock_irqrestore(&shdict_snapshot_lock, flags);
+}
+
+bool shdict_snapshot_begin(u64 *generation)
+{
+	unsigned long flags;
+	bool ready;
+
+	spin_lock_irqsave(&shdict_snapshot_lock, flags);
+	*generation = shdict_snapshot_generation;
+	ready = !shdict_snapshot_writers;
+	spin_unlock_irqrestore(&shdict_snapshot_lock, flags);
+	return ready;
+}
+
+bool shdict_snapshot_retry(u64 generation)
+{
+	unsigned long flags;
+	bool retry;
+
+	spin_lock_irqsave(&shdict_snapshot_lock, flags);
+	retry = shdict_snapshot_writers ||
+		generation != shdict_snapshot_generation;
+	spin_unlock_irqrestore(&shdict_snapshot_lock, flags);
+	return retry;
+}
 
 #ifdef CONFIG_SECURITY_LUA_LSM_STATS
 
@@ -257,6 +312,8 @@ kvcache_module_link(struct kvcache_dict *dict,
 		goto unlock;
 	}
 
+	if (dict->snapshot_tracked)
+		shdict_snapshot_write_begin();
 	prev = RB_INSERT(kvcache, &dict->root, node);
 	if (prev) {
 		kvcache_node_hold(prev);
@@ -270,6 +327,8 @@ kvcache_module_link(struct kvcache_dict *dict,
 			spin_unlock(&module->kvnodes_lock);
 		}
 	}
+	if (dict->snapshot_tracked)
+		shdict_snapshot_write_end();
 
 unlock:
 	write_unlock_irqrestore(&dict->lock, flags);
@@ -284,6 +343,8 @@ kvcache_module_unlink_unlocked(struct kvcache_dict *dict,
 	/* Two deleters may have acquired lookup references to the same node. */
 	if (RB_FIND(kvcache, &dict->root, node) != node)
 		return false;
+	if (dict->snapshot_tracked)
+		shdict_snapshot_write_begin();
 	RB_REMOVE(kvcache, &dict->root, node);
 	atomic_dec(&dict->count);
 	if (module) {
@@ -292,6 +353,8 @@ kvcache_module_unlink_unlocked(struct kvcache_dict *dict,
 		atomic_dec(&module->kvnodes_count);
 		spin_unlock(&module->kvnodes_lock);
 	}
+	if (dict->snapshot_tracked)
+		shdict_snapshot_write_end();
 	return true;
 }
 
@@ -374,8 +437,12 @@ static int kvcache_node_refill(lua_State *L, int idx,
 		return err;
 
 	write_lock_irqsave(&node->lock, flags);
+	if (node->dict->snapshot_tracked)
+		shdict_snapshot_write_begin();
 	kvcache_node_clear(node);
 	kvcache_node_copy(node, &ntmp);
+	if (node->dict->snapshot_tracked)
+		shdict_snapshot_write_end();
 	write_unlock_irqrestore(&node->lock, flags);
 	kvcache_node_clear(&ntmp);
 	return 0;
@@ -534,9 +601,13 @@ update:
 		err = -EINVAL;
 		write_lock_irqsave(&node->lock, flags);
 		if (node->tt == LUA_TNUMBER) {
+			if (dict->snapshot_tracked)
+				shdict_snapshot_write_begin();
 			node->n += n;
 			n = node->n;
 			err = 0;
+			if (dict->snapshot_tracked)
+				shdict_snapshot_write_end();
 		}
 		write_unlock_irqrestore(&node->lock, flags);
 		kvcache_node_drop(node);
@@ -622,6 +693,7 @@ void kvcache_dict_free(struct kvcache_dict *dict)
 
 void kvcache_dict_init(struct kvcache_dict *dict)
 {
+	dict->snapshot_tracked = false;
 	atomic_set(&dict->state, KVCACHE_DICT_INITING);
 	__kvcache_dict_init(dict);
 	atomic_set_release(&dict->state, KVCACHE_DICT_READY);
@@ -649,44 +721,116 @@ static int kvcache_dump_append(char *buf, size_t size, size_t *pos,
 	return 0;
 }
 
-/*
- * Append a stable, text-safe snapshot of one shared dictionary.  Node
- * references are collected under the tree lock so formatting never holds the
- * dictionary lock.  Individual value locks protect replacement while a line
- * is copied to the output buffer.
- */
-int kvcache_dump(struct kvcache_dict *dict, const char *module_name,
-		 const char *dict_name, char *buf, size_t size, size_t *pos)
-{
-	struct kvcache_node **nodes;
+struct kvcache_dump_entry {
 	struct kvcache_node *node;
-	struct kvcache_node value;
+	int tt;
+	union {
+		int b;
+		lua_Number n;
+		struct kvcache_string *s;
+	};
+};
+
+struct kvcache_dump_snapshot {
+	struct list_head list;
+	const char *module_name;
+	const char *dict_name;
+	size_t count;
+	struct kvcache_dump_entry entries[];
+};
+
+/* Capture references and immutable values, without text formatting. */
+int kvcache_dump_capture(struct kvcache_dict *dict, const char *module_name,
+			 const char *dict_name, struct list_head *snapshots,
+			 size_t *remaining)
+{
+	struct kvcache_dump_snapshot *snapshot;
+	struct kvcache_node *node;
 	unsigned long flags;
-	size_t capacity;
-	size_t count = 0;
-	size_t i;
+	size_t capacity, i;
 	int err = 0;
-	int n;
 
-	if (!kvcache_dict_ready(dict) || !atomic_read(&dict->count))
+	if (!kvcache_dict_ready(dict))
 		return 0;
-
-	capacity = dict->capacity;
-	nodes = kmalloc_array(capacity, sizeof(*nodes), GFP_KERNEL);
-	if (!nodes)
+	capacity = atomic_read(&dict->count);
+	if (!capacity)
+		return 0;
+	if (!*remaining)
+		return -E2BIG;
+	capacity = min(capacity, *remaining);
+	snapshot = kvzalloc(struct_size(snapshot, entries, capacity), GFP_KERNEL);
+	if (!snapshot)
 		return -ENOMEM;
+	snapshot->module_name = module_name;
+	snapshot->dict_name = dict_name;
+	list_add_tail(&snapshot->list, snapshots);
 
 	read_lock_irqsave(&dict->lock, flags);
 	RB_FOREACH(node, kvcache, &dict->root) {
-		if (count == capacity)
+		if (snapshot->count == capacity) {
+			err = -E2BIG;
 			break;
+		}
 		kvcache_node_hold(node);
-		nodes[count++] = node;
+		snapshot->entries[snapshot->count++].node = node;
 	}
 	read_unlock_irqrestore(&dict->lock, flags);
+	if (err)
+		return err;
+	*remaining -= snapshot->count;
+
+	for (i = 0; i < snapshot->count; i++) {
+		struct kvcache_dump_entry *entry = &snapshot->entries[i];
+
+		node = snapshot->entries[i].node;
+		read_lock_irqsave(&node->lock, flags);
+		entry->tt = node->tt;
+		switch (node->tt) {
+		case LUA_TBOOLEAN:
+			entry->b = node->b;
+			break;
+		case LUA_TNUMBER:
+			entry->n = node->n;
+			break;
+		case LUA_TSTRING:
+			entry->s = node->s;
+			kvcache_string_hold(entry->s);
+			break;
+		}
+		read_unlock_irqrestore(&node->lock, flags);
+	}
+	return 0;
+}
+
+void kvcache_dump_free(struct list_head *snapshots)
+{
+	struct kvcache_dump_snapshot *snapshot, *next;
+	size_t i;
+
+	list_for_each_entry_safe(snapshot, next, snapshots, list) {
+		for (i = 0; i < snapshot->count; i++) {
+			if (snapshot->entries[i].tt == LUA_TSTRING)
+				kvcache_string_drop(snapshot->entries[i].s);
+			kvcache_node_drop(snapshot->entries[i].node);
+		}
+		list_del(&snapshot->list);
+		kvfree(snapshot);
+	}
+}
+
+/* Only called after global generation validation; data is already copied. */
+static int kvcache_dump_one(struct kvcache_dump_snapshot *snapshot,
+			    char *buf, size_t size, size_t *pos)
+{
+	const char *module_name = snapshot->module_name;
+	const char *dict_name = snapshot->dict_name;
+	struct kvcache_node *node;
+	struct kvcache_dump_entry *value;
+	size_t count = snapshot->count, i;
+	int err = 0, n;
 
 	for (i = 0; i < count; i++) {
-		node = nodes[i];
+		node = snapshot->entries[i].node;
 		err = kvcache_dump_append(buf, size, pos, module_name,
 					  strlen(module_name));
 		if (err)
@@ -710,19 +854,16 @@ int kvcache_dump(struct kvcache_dict *dict, const char *module_name,
 		if (err)
 			goto out;
 
-		value.tt = LUA_TNIL;
-		read_lock_irqsave(&node->lock, flags);
-		kvcache_node_copy(&value, node);
-		read_unlock_irqrestore(&node->lock, flags);
+		value = &snapshot->entries[i];
 
-		switch (value.tt) {
+		switch (value->tt) {
 		case LUA_TBOOLEAN:
 			n = snprintf(buf + *pos, size - *pos, " boolean %s\n",
-				     value.b ? "true" : "false");
+				     value->b ? "true" : "false");
 			break;
 		case LUA_TNUMBER:
 			n = snprintf(buf + *pos, size - *pos, " number %lld\n",
-				     (long long)value.n);
+				     (long long)value->n);
 			break;
 		case LUA_TSTRING:
 			n = snprintf(buf + *pos, size - *pos, " string ");
@@ -731,8 +872,8 @@ int kvcache_dump(struct kvcache_dict *dict, const char *module_name,
 				break;
 			}
 			*pos += n;
-			err = kvcache_dump_append(buf, size, pos, value.s->data,
-						  value.s->len);
+			err = kvcache_dump_append(buf, size, pos, value->s->data,
+						  value->s->len);
 			if (!err) {
 				if (*pos + 1 >= size)
 					err = -E2BIG;
@@ -749,8 +890,6 @@ int kvcache_dump(struct kvcache_dict *dict, const char *module_name,
 			n = -EINVAL;
 			break;
 		}
-		if (value.tt == LUA_TSTRING)
-			kvcache_string_drop(value.s);
 
 		if (err)
 			goto out;
@@ -766,10 +905,22 @@ int kvcache_dump(struct kvcache_dict *dict, const char *module_name,
 	}
 
 out:
-	for (i = 0; i < count; i++)
-		kvcache_node_drop(nodes[i]);
-	kfree(nodes);
 	return err;
+}
+
+int kvcache_dump_format(struct list_head *snapshots, char *buf, size_t size,
+			size_t *pos)
+{
+	struct kvcache_dump_snapshot *snapshot;
+	int err;
+
+	*pos = 0;
+	list_for_each_entry(snapshot, snapshots, list) {
+		err = kvcache_dump_one(snapshot, buf, size, pos);
+		if (err)
+			return err;
+	}
+	return 0;
 }
 
 /******************************** object cache *******************************/

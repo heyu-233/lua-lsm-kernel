@@ -1,5 +1,9 @@
 # Lua-LSM final validation — 2026-10-16
 
+Historical baseline, before the consistent-enumeration extension. The later
+2026-10-27 snapshot validation section below supersedes its enumeration
+contract; the following performance numbers are NOT results for that change.
+
 Behavioral source revision: `fbd486345` (and the preceding two local commits).
 This record and analyzer-help changes do not alter the measured kernel code.
 All testing was in disposable RV64 QEMU guests, not on the host kernel.
@@ -86,7 +90,7 @@ config fragments and the protocol/ownership/permission contract.
 ## Limits
 
 This is a tested development interface, not a stable production ABI.
-Enumeration is not globally atomic, shared FD write/read is not an automatic
+At this baseline enumeration was not globally atomic. Shared FD write/read is not an automatic
 transaction, and errors do not imply rollback. Allocation-fault and
 kmemleak profiles are separate; the empty leak report is not proof for every
 fault/interleaving combination. No KCSAN, exhaustive instruction-level

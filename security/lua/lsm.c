@@ -618,6 +618,7 @@ static int lua_shared_index(lua_State *L)
 			return 0;
 		}
 		kvcache_dict_init(&shdict->dict);
+		shdict->dict.snapshot_tracked = true;
 		memcpy(shdict->name, name, l);
 		shdict->name[l] = '\0';
 
@@ -629,8 +630,10 @@ static int lua_shared_index(lua_State *L)
 			}
 		}
 		if (!found) {
+			shdict_snapshot_write_begin();
 			atomic_inc(&module->shdict_count);
 			list_add_tail_rcu(&shdict->list, &module->shdicts);
+			shdict_snapshot_write_end();
 		}
 		spin_unlock_irqrestore(&module->shdict_lock, flags);
 
@@ -958,7 +961,8 @@ out:
 	return ctx.err;
 }
 
-int lua_lsm_shdict_dump(char *buf, size_t size, size_t *result_len)
+/* Caller holds modules_ss; rejected attempts never reach userspace. */
+static int shdict_dump_capture(struct list_head *snapshots, size_t *remaining)
 {
 	struct lua_lsm_module_shdict **dicts;
 	struct lua_lsm_module_shdict *shdict;
@@ -967,10 +971,7 @@ int lua_lsm_shdict_dump(char *buf, size_t size, size_t *result_len)
 	size_t count;
 	size_t i;
 	int err = 0;
-	int idx;
 
-	*result_len = 0;
-	idx = srcu_read_lock(&modules_ss);
 	list_for_each_entry_srcu(module, &lsm_modules, list,
 				 srcu_read_lock_held(&modules_ss)) {
 		if (READ_ONCE(module->state) != LMS_STATE_LIVE)
@@ -996,8 +997,8 @@ int lua_lsm_shdict_dump(char *buf, size_t size, size_t *result_len)
 		count = i;
 
 		for (i = 0; i < count; i++) {
-			err = kvcache_dump(&dicts[i]->dict, module->name,
-					   dicts[i]->name, buf, size, result_len);
+			err = kvcache_dump_capture(&dicts[i]->dict, module->name,
+						   dicts[i]->name, snapshots, remaining);
 			if (err)
 				break;
 		}
@@ -1005,7 +1006,40 @@ int lua_lsm_shdict_dump(char *buf, size_t size, size_t *result_len)
 		if (err)
 			break;
 	}
+	return err;
+}
+
+int lua_lsm_shdict_dump(char *buf, size_t size, size_t *result_len)
+{
+	LIST_HEAD(snapshots);
+	u64 generation;
+	size_t len, remaining;
+	int attempt, idx, err = -EAGAIN;
+
+	*result_len = 0;
+	idx = srcu_read_lock(&modules_ss);
+	for (attempt = 0; attempt < 8; attempt++) {
+		if (shdict_snapshot_begin(&generation)) {
+			/* Every escaped output row needs at least eight bytes. */
+			remaining = size / 8;
+			err = shdict_dump_capture(&snapshots, &remaining);
+			if (!shdict_snapshot_retry(generation)) {
+				if (!err)
+					err = kvcache_dump_format(&snapshots, buf, size, &len);
+				kvcache_dump_free(&snapshots);
+				if (!err)
+					*result_len = len;
+				break;
+			}
+			kvcache_dump_free(&snapshots);
+		}
+		err = -EAGAIN;
+		cond_resched();
+	}
 	srcu_read_unlock(&modules_ss, idx);
+	/* Do not retain partial or rejected output, including on E2BIG. */
+	if (err && size)
+		buf[0] = '\0';
 	return err;
 }
 
@@ -1408,8 +1442,10 @@ int lua_lsm_module_register(const char *code, size_t len)
 				atomic_inc(&lua_lsm_hook_stats[i].nhooks);
 		}
 
+		shdict_snapshot_write_begin();
 		WRITE_ONCE(module->state, LMS_STATE_LIVE);
 		list_add_tail_rcu(&module->list, &lsm_modules);
+		shdict_snapshot_write_end();
 		/*
 		 * Once any Lua policy has been loaded, inactive free-hook cleanup
 		 * must stay armed for objects that outlive later module unload.
@@ -1572,7 +1608,9 @@ int lua_lsm_module_unregister(const char *name)
 		}
 	}
 	if (found && READ_ONCE(module->state) == LMS_STATE_LIVE) {
+		shdict_snapshot_write_begin();
 		WRITE_ONCE(module->state, LMS_STATE_GOING);
+		shdict_snapshot_write_end();
 		static_branch_dec(&lua_lsm_modules_active);
 
 		for (i = 0; lua_lsm_hook_stats[i].name; i++) {

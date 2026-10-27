@@ -33,7 +33,7 @@ elif [ "$mode" = trace ]; then
 elif [ "$mode" = kmemleak ]; then
 	sh /tests/shdict_kmemleak.sh || rc=$?
 else
-	for test in setjmp_recovery shdict_poc shdict_stress shdict_boundary shdict_shared_fd shdict_lifecycle; do
+	for test in setjmp_recovery shdict_poc shdict_stress shdict_boundary shdict_shared_fd shdict_snapshot shdict_lifecycle; do
 		sh "/tests/$test.sh"
 		status=$?
 		echo "LUA_LSM_TEST $test status=$status"

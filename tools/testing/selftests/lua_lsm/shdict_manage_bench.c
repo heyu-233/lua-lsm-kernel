@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #include <inttypes.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <time.h>
 #include "shdict_test.h"
@@ -9,6 +10,7 @@
 static const char policy[] = "return {name='managebench',license='GPL-2.0',"
 	"inode_mkdir=function() return true end}";
 static pthread_barrier_t ready;
+static atomic_uint snapshot_retries;
 struct worker {
 	pthread_t thread;
 	unsigned int id, samples;
@@ -27,11 +29,17 @@ static uint64_t now(void)
 static int snapshot(void)
 {
 	char buf[65537];
-	int fd = open(SD_BASE "shdict", O_RDONLY), ret;
+	int fd = open(SD_BASE "shdict", O_RDONLY), ret, attempt;
 
 	if (fd < 0)
 		return -errno;
-	ret = sd_read(fd, buf, sizeof(buf) - 1);
+	for (attempt = 0; attempt < 200; attempt++) {
+		ret = sd_read(fd, buf, sizeof(buf) - 1);
+		if (ret != -EAGAIN)
+			break;
+		atomic_fetch_add(&snapshot_retries, 1);
+		usleep(1000);
+	}
 	close(fd);
 	if (ret <= 0)
 		return ret ? ret : -EIO;
@@ -173,6 +181,7 @@ int main(int argc, char **argv)
 		}
 	}
 	puts("MANAGE_CSV_END");
+	printf("MANAGE_ENUM_RETRIES=%u (included in latency)\n", atomic_load(&snapshot_retries));
 	close(fd);
 	ret |= sd_unregister("managebench");
 	puts(ret ? "LUA-LSM-MANAGE-BENCH: FAIL" : "LUA-LSM-MANAGE-BENCH: ALL PASS");

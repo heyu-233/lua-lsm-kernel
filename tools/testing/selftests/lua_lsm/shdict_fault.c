@@ -108,6 +108,9 @@ int main(void)
 	command[n + 2048] = 0;
 	if (sd_expect(fd, command, "true"))
 		ksft_exit_fail_msg("prepare string fixture\n");
+	/* A later capture allocation may fail after the first dict holds refs. */
+	if (sd_expect(fd, "set faultcase second payload string retained", "true"))
+		ksft_exit_fail_msg("prepare second snapshot dictionary\n");
 	close(fd);
 	for (target = 0; target < TARGETS; target++) {
 		injected = 0;

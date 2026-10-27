@@ -7,8 +7,8 @@
 # in the lua-lsm QEMU development initramfs (see README.md for the repro
 # instructions).
 
-TEST_PROGS := setjmp_recovery.sh shdict_poc.sh shdict_stress.sh shdict_lifecycle.sh shdict_shared_fd.sh shdict_boundary.sh
-TEST_GEN_PROGS_EXTENDED := shdict_lifecycle shdict_bench shdict_shared_fd shdict_boundary shdict_fault shdict_manage_bench
+TEST_PROGS := setjmp_recovery.sh shdict_poc.sh shdict_stress.sh shdict_lifecycle.sh shdict_shared_fd.sh shdict_boundary.sh shdict_snapshot.sh
+TEST_GEN_PROGS_EXTENDED := shdict_lifecycle shdict_bench shdict_shared_fd shdict_boundary shdict_fault shdict_manage_bench shdict_snapshot
 TEST_FILES := shdict_test.h shdict_trace.sh shdict_kmemleak.sh qemu_init.sh setjmp_recovery.lua setjmp_runtime_error.lua \
 	setjmp_syntax_error.lua shdict_poc.lua shdict_stress.lua shdict_lifecycle.lua
 

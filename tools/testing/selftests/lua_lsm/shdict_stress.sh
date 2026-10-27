@@ -33,7 +33,7 @@ reader()
 {
 	i=1
 	while [ "$i" -le "$ROUNDS" ]; do
-		cat "$SHDICT" > /dev/null || exit 1
+		"$(dirname -- "$0")/shdict_snapshot" --check || exit 1
 		cat /proc/version > /dev/null || exit 1
 		i=$((i + 1))
 	done

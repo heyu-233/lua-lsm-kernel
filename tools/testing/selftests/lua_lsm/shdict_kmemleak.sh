@@ -12,6 +12,7 @@ cat "$control"
 echo 'KMEMLEAK_BEFORE_END'
 "$testdir/shdict_boundary"
 "$testdir/shdict_shared_fd"
+"$testdir/shdict_snapshot"
 LIFECYCLE_ROUNDS=10 sh "$testdir/shdict_lifecycle.sh"
 sleep 6
 echo scan > "$control"

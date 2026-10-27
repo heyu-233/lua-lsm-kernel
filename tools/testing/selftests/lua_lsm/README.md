@@ -286,9 +286,47 @@ The maximum write is 4096 bytes including framing/newline. Scalar results
 have a 4096-byte limit; enumeration has a 64-KiB buffer and returns E2BIG
 instead of a successful partial snapshot. Empty dictionaries do not add
 placeholder lines; `modules` is the separate module-listing interface.
-Enumeration gathers references and copies each value safely, but concurrent
-hooks may change different keys between copies: it is not a global
-point-in-time transaction. lightuserdata addresses remain hidden.
+Successful enumeration is a point-in-time snapshot of all exported rows.
+A short IRQ-safe spinlock protects a global generation and active-writer
+count, not the traversal or Lua execution. Named-dictionary insertion,
+replacement, deletion and incr participate in both management and Lua-hook
+paths. Dictionary publication and module LIVE/GOING transitions participate
+as well. Object-property caches are not exported and do not invalidate a
+snapshot. Existing SRCU, tree/node locks and references remain necessary
+for memory safety; version validation alone does not replace them.
+
+The reader first captures node and immutable-value references, then validates
+the generation BEFORE formatting the text. Later updates do not invalidate
+these retained copies, so formatting is outside the conflict window. Capture
+storage has a row-count budget derived from the output-buffer size; it cannot
+grow without bound with the number of dictionaries/keys.
+
+The reader accepts an attempt only if no writer was active at either end
+and the generation did not change. Otherwise it discards the attempt and
+retries, at most eight attempts per read syscall. Sustained writes can cause
+EAGAIN, with zero output bytes; retry the read (the same FD is valid) after
+backoff. Allocation/size errors also expose no partial output. Once a
+snapshot has been prepared successfully, partial reads on that open consume
+the same copied bytes despite later updates or module removal. This is not
+a multi-command update transaction or a guarantee that the data is still
+current when read returns. lightuserdata addresses remain hidden.
+
+`shdict_snapshot.sh` checks cached partial reads across delete/dictionary
+creation, cross-module ordered counters, and counters updated from a Lua
+inode_mkdir hook across two dictionaries. The invariant is first >= second
+and first - second <= 1: a mixed traversal can violate it. EAGAIN must not
+alter the user buffer, all successful snapshots must satisfy the invariant,
+and fresh reads must recover once writers stop. The helper's `--check` mode
+is used only by the shell stress test to perform bounded EAGAIN retries.
+Lifecycle and management benchmark readers also retry with a bounded backoff;
+the benchmark reports caller retries and includes them in measured latency.
+
+Consistency trades availability and throughput for a stronger read contract:
+large snapshots may be refused repeatedly during continuous updates. The
+generation lock introduces short shared bookkeeping on named writes, but no
+global mutex is held while traversing dictionaries, formatting output or
+running Lua. The earlier performance results describe the pre-snapshot
+revision and must not be reused as measurements of this change.
 
 An error does not guarantee rollback. A dictionary update can have committed
 before response conversion fails. Requests entering parsing replace the
